@@ -111,14 +111,14 @@ export function formatWorkingHours(schedule: RoleSchedule): string {
  */
 export const DEFAULT_ROLE_SCHEDULE: RoleSchedule = {
   role: 'employee',
-  start_hour: 10,
+  start_hour: 14,         
   start_minute: 0,
-  end_hour: 20,
+  end_hour: 21,           
   end_minute: 0,
-  standard_work_hours: 10,
-  lunch_start_hour: 14,
+  standard_work_hours: 7, 
+  lunch_start_hour: 17,   
   lunch_start_minute: 0,
-  lunch_end_hour: 15,
+  lunch_end_hour: 18,     
   lunch_end_minute: 0,
-  overtime_threshold: 10
+  overtime_threshold: 7   
 };
