@@ -24,13 +24,13 @@ export const OFFICE_TIMEZONE = import.meta.env.VITE_OFFICE_TIMEZONE || 'Asia/Kol
  */
 export const toOfficeDate = (timestamp: string | Date): Date => {
   if (!timestamp) {
-    throw new Error('Invalid timestamp provided to toOfficeDate');
+    return new Date();
   }
   
   const utcDate = typeof timestamp === 'string' ? parseISO(timestamp) : timestamp;
   
   if (!isValid(utcDate)) {
-    throw new Error(`Invalid timestamp: ${timestamp}`);
+    return new Date();
   }
   
   return utcToZonedTime(utcDate, OFFICE_TIMEZONE);

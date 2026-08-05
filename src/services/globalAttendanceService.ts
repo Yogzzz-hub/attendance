@@ -1,7 +1,6 @@
 import { AttendanceRecord, GeolocationData } from '../types';
 import type { RoleSchedule } from '../types';
 import {
-  toOfficeDate,
   toOfficeDateSafe,
   getOfficeTodayIso,
   getOfficeNow,
@@ -111,8 +110,8 @@ class GlobalAttendanceService {
       clockOut: toOfficeDateSafe(data.logout_time as string | undefined) || null,
       lunchStart: toOfficeDateSafe(data.lunch_start as string | undefined) || null,
       lunchEnd: toOfficeDateSafe(data.lunch_end as string | undefined) || null,
-      createdAt: toOfficeDate(data.created_at as string),
-      updatedAt: toOfficeDate(data.updated_at as string),
+      createdAt: toOfficeDateSafe(data.created_at as string) || null,
+      updatedAt: toOfficeDateSafe(data.updated_at as string) || null,
       // Use calculated hours with fallback
       hoursWorked: calcHours,
       totalHours: calcHours,
@@ -122,7 +121,7 @@ class GlobalAttendanceService {
         const btData = bt as Record<string, unknown>;
         return {
           id: btData.id as string,
-          startTime: toOfficeDate(btData.start as string),
+          startTime: toOfficeDateSafe(btData.start as string) || null,
           endTime: toOfficeDateSafe(btData.end as string) || null,
           type: (btData.type as string) || 'break',
           duration: (btData.duration != null && btData.duration !== '') ? Number(btData.duration) : 0
@@ -132,7 +131,7 @@ class GlobalAttendanceService {
         const btData = bt as Record<string, unknown>;
         return {
           id: btData.id as string,
-          start: toOfficeDate(btData.start as string),
+          start: toOfficeDateSafe(btData.start as string) || null,
           end: toOfficeDateSafe(btData.end as string) || null,
           type: (btData.type as string) || 'break',
           duration: (btData.duration != null && btData.duration !== '') ? Number(btData.duration) : 0
@@ -151,11 +150,15 @@ class GlobalAttendanceService {
       location: data.location as GeolocationData || null,
       isLateFromLunch: (data.is_late_from_lunch as boolean) || false,
       lunchLateReason: (data.lunch_late_reason as string | undefined) || null,
-      overtime: overtime
+      overtime: overtime,
+      workMode: (data.work_mode as 'on_site' | 'wfh') || 'on_site',
+      activeSeconds: (data.active_seconds as number) || 0,
+      breakSeconds: (data.break_seconds as number) || 0,
+      activityScore: (data.activity_score as number) || 100.0
     } as AttendanceRecord;
   }
 
-  async clockIn(userId: string, lateReason?: string, location?: GeolocationData, clientIP?: string): Promise<AttendanceRecord> {
+   async clockIn(userId: string, lateReason?: string, location?: GeolocationData, clientIP?: string, workMode: 'on_site' | 'wfh' = 'on_site'): Promise<AttendanceRecord> {
     try {
       console.log('🕐 Starting clock in for user:', userId);
 
@@ -193,7 +196,8 @@ class GlobalAttendanceService {
       const { data: attendanceRecordRaw, error: insertError } = await supabase
         .rpc('clock_in', {
           p_user_id: userId,
-          p_date: todayIso
+          p_date: todayIso,
+          p_work_mode: workMode
         })
         .single();
 
@@ -201,7 +205,7 @@ class GlobalAttendanceService {
 
       const attendanceRecord = attendanceRecordRaw as ClockInRPCResult;
 
-      const clockInTime = toOfficeDate(attendanceRecord.login_time);
+      const clockInTime = toOfficeDateSafe(attendanceRecord.login_time) || new Date();
       const isLate = this.isLateArrival(clockInTime, schedule);
 
       // Apply additional fields via update_attendance_record RPC (server-side validation)
@@ -237,7 +241,11 @@ class GlobalAttendanceService {
         overtime: 0,
         status: this.determineStatus(clockInTime, null, schedule, isLate),
         createdAt: clockInTime,
-        updatedAt: clockInTime
+        updatedAt: clockInTime,
+        workMode: workMode,
+        activeSeconds: 0,
+        breakSeconds: 0,
+        activityScore: 100.0
       };
 
       console.log('✅ Clock in successful:', newAttendanceRecord);
@@ -544,16 +552,6 @@ class GlobalAttendanceService {
         const gteDate = new Date(startDate);
         const lteDate = new Date(endDate);
 
-        // ── CRITICAL FIX ──────────────────────────────────────────────────────
-        // Same Postgres TIMESTAMPTZ boundary issue as in getAttendanceRange().
-        // Using raw ISO date strings for .gte/.lte means Postgres applies UTC-
-        // midnight anchors, silently dropping records in the first 5½ h of the
-        // start day (IST 00:00–05:29 → prior-day 18:30–22:59 UTC) and the last
-        // 5½ h of the end day (IST 17:30–23:59 → same-day 12:00–18:29 UTC).
-        // Shift the lower bound back 1 day (to include those early-IST hours) and
-        // the upper bound forward 1 day (to include the late-IST Sunday hours).
-        // ──────────────────────────────────────────────────────────────────────
-
         gteDate.setDate(gteDate.getDate() - 1);
         lteDate.setDate(lteDate.getDate() + 1);
 
@@ -574,7 +572,6 @@ class GlobalAttendanceService {
         return [];
       }
 
-      // PHASE 1: Multi-role schedule resolution
       const roleSet = new Set<string>();
       data.forEach(record => {
         const emp = record.employees as Record<string, unknown> | undefined;
@@ -600,6 +597,106 @@ class GlobalAttendanceService {
       });
     } catch (error) {
       console.error('Error getting all attendance records:', error);
+      return [];
+    }
+  }
+
+  async getWFHDailySummary(date: string): Promise<Array<{
+    employeeId: string;
+    employeeName: string;
+    department: string;
+    role: string;
+    activeSeconds: number;
+    breakSeconds: number;
+    activityScore: number;
+    lastActiveApp: string | null;
+    attendanceRecordId: string;
+  }>> {
+    try {
+      const parts = date.split('-');
+      if (parts.length !== 3) return [];
+      const [day, month, year] = parts;
+      const dateIso = `${year}-${month}-${day}`;
+
+      const { data, error } = await supabase
+        .from(this.ATTENDANCE_TABLE)
+        .select(`
+          id,
+          user_id,
+          active_seconds,
+          break_seconds,
+          activity_score,
+          employees:user_id (name, department, role)
+        `)
+        .eq('date', dateIso)
+        .eq('work_mode', 'wfh')
+        .not('login_time', 'is', null)
+        .order('user_id', { ascending: true });
+
+      if (error) throw error;
+      if (!data || data.length === 0) return [];
+
+      const summary = data.map((record: Record<string, unknown>) => {
+        const emp = (record.employees as Record<string, unknown> | undefined);
+        return {
+          employeeId: record.user_id as string,
+          employeeName: (emp?.name as string) || 'Unknown',
+          department: (emp?.department as string) || 'Unknown',
+          role: (emp?.role as string) || 'employee',
+          activeSeconds: (record.active_seconds as number) || 0,
+          breakSeconds: (record.break_seconds as number) || 0,
+          activityScore: (record.activity_score as number) || 0,
+          lastActiveApp: null,
+          attendanceRecordId: record.id as string,
+        };
+      });
+
+      // Enrich with last known active app from wfh_activity_logs
+      for (const item of summary) {
+        const { data: logs } = await supabase
+          .from('wfh_activity_logs')
+          .select('active_app, timestamp')
+          .eq('attendance_record_id', item.attendanceRecordId)
+          .order('timestamp', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (logs) {
+          item.lastActiveApp = logs.active_app || null;
+        }
+      }
+
+      return summary;
+    } catch (error) {
+      console.error('Error loading WFH daily summary:', error);
+      return [];
+    }
+  }
+
+  async getWFHActivityLogs(attendanceRecordId: string): Promise<Array<{
+    id: string;
+    timestamp: string;
+    activeApp: string | null;
+    activityPercentage: number;
+  }>> {
+    try {
+      const { data, error } = await supabase
+        .from('wfh_activity_logs')
+        .select('id, timestamp, active_app, activity_percentage')
+        .eq('attendance_record_id', attendanceRecordId)
+        .order('timestamp', { ascending: true });
+
+      if (error) throw error;
+      if (!data || data.length === 0) return [];
+
+      return data.map((log: Record<string, unknown>) => ({
+        id: log.id as string,
+        timestamp: log.timestamp as string,
+        activeApp: (log.active_app as string | null) || null,
+        activityPercentage: (log.activity_percentage as number) || 0,
+      }));
+    } catch (error) {
+      console.error('Error loading WFH activity logs:', error);
       return [];
     }
   }

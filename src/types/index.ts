@@ -77,6 +77,10 @@ export interface AttendanceRecord {
   hoursWorked?: number; // Alternative field name used in components
   totalBreakHours?: number;
   totalBreakMinutes?: number; // Sum of break durations in minutes
+  workMode?: 'on_site' | 'wfh';
+  activeSeconds?: number;
+  breakSeconds?: number;
+  activityScore?: number;
   createdAt: Date;
   updatedAt?: Date;
 }

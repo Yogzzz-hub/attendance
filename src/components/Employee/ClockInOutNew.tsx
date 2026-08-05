@@ -111,6 +111,13 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
   // Active employee schedule (fetched from DB); falls back to DEFAULT_ROLE_SCHEDULE while loading or on error
   const [activeSchedule, setActiveSchedule] = useState<RoleSchedule | null>(null);
   const [lunchEndTime, setLunchEndTime] = useState<Date>(getLunchEndTime(DEFAULT_ROLE_SCHEDULE, new Date()));
+  const [workMode, setWorkMode] = useState<'on_site' | 'wfh'>('on_site');
+
+  // WFH timer state
+  const [wfhActiveSeconds, setWfhActiveSeconds] = useState(0);
+  const [wfhBreakStart, setWfhBreakStart] = useState<Date | null>(null);
+  const wfhTimerRef = useRef<number | null>(null);
+  const WFH_TARGET_SECONDS = 25200; // 7 hours
 
   // Synchronous lock to prevent concurrent clock-in submissions
   const clockInLock = useRef(false);
@@ -242,7 +249,10 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
 
     try {
       setIsValidating(true);
-      await validateLocationConstraints();
+      // Skip location/network validation for WFH mode
+      if (workMode !== 'wfh') {
+        await validateLocationConstraints();
+      }
 
       // Check if it would be a late arrival based on configured work start time
       const now = new Date();
@@ -295,7 +305,9 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
       const record = await globalAttendanceService.clockIn(
         employee.id,
         lateReason.trim() || undefined,
-        locationPayload
+        locationPayload,
+        undefined,
+        workMode
       );
       setTodayRecord(record);
       toast.success('Clocked in successfully!');
@@ -500,6 +512,48 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
     }
   }, [todayRecord, isOnBreak, employee?.break_reminder_enabled, employee?.default_break_duration]);
 
+  // WFH active work timer (7-hour target = 25,200 seconds)
+  useEffect(() => {
+    // Sync with DB value when record changes
+    if (todayRecord?.workMode === 'wfh' && todayRecord.activeSeconds !== undefined) {
+      setWfhActiveSeconds(todayRecord.activeSeconds);
+    }
+
+    // Clear any existing timer
+    if (wfhTimerRef.current) {
+      clearInterval(wfhTimerRef.current);
+      wfhTimerRef.current = null;
+    }
+
+    const isWFHActive = todayRecord?.workMode === 'wfh'
+      && todayRecord?.clockIn
+      && !todayRecord?.clockOut
+      && !isOnBreak
+      && (!todayRecord?.lunchStart || todayRecord?.lunchEnd);
+
+    if (isWFHActive) {
+      wfhTimerRef.current = window.setInterval(() => {
+        setWfhActiveSeconds(prev => prev + 1);
+      }, 1000);
+    }
+
+    return () => {
+      if (wfhTimerRef.current) {
+        clearInterval(wfhTimerRef.current);
+        wfhTimerRef.current = null;
+      }
+    };
+  }, [todayRecord?.workMode, todayRecord?.clockIn, todayRecord?.clockOut, todayRecord?.activeSeconds, isOnBreak, todayRecord?.lunchStart, todayRecord?.lunchEnd]);
+
+  // Track break start time for WFH break duration display
+  useEffect(() => {
+    if (isOnBreak) {
+      setWfhBreakStart(new Date());
+    } else {
+      setWfhBreakStart(null);
+    }
+  }, [isOnBreak]);
+
   // Load working hours configuration to keep UI in sync with admin updates
   useEffect(() => {
     const fetchConfig = async () => {
@@ -630,24 +684,101 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
         </div>
       )}
 
-      {/* Location Status */}
+      {/* Location / Work Mode Status */}
       <div className="bg-white dark:bg-neutral-900 border border-gray-100 dark:border-neutral-800 rounded-2xl p-4 mb-4">
         <div className="flex items-center">
-          <div className={`h-2 w-2 rounded-full mr-2 ${currentLocation ? 'bg-green-500' : 'bg-red-500'}`}></div>
+          <div className={`h-2 w-2 rounded-full mr-2 ${workMode === 'wfh' ? 'bg-blue-500' : currentLocation ? 'bg-green-500' : 'bg-red-500'}`}></div>
           <div>
-            <p className="text-sm font-medium text-gray-900 dark:text-white dark:text-white">Location Status</p>
+            <p className="text-sm font-medium text-gray-900 dark:text-white dark:text-white">
+              {workMode === 'wfh' ? 'Work From Home Mode' : 'Location Status'}
+            </p>
             <p className="text-sm text-gray-600 dark:text-neutral-400">
-              {currentLocation
-                ? `📍 Location detected (${currentLocation.latitude.toFixed(6)}, ${currentLocation.longitude.toFixed(6)})`
-                : locationError || 'Location access required for attendance'}
+              {workMode === 'wfh'
+                ? '🏠 Location verification skipped for WFH'
+                : currentLocation
+                  ? `📍 Location detected (${currentLocation.latitude.toFixed(6)}, ${currentLocation.longitude.toFixed(6)})`
+                  : locationError || 'Location access required for attendance'}
             </p>
           </div>
         </div>
       </div>
 
+      {/* Work Mode Selector */}
+      {!todayRecord?.clockIn && (
+        <div className="bg-white dark:bg-neutral-900 border border-gray-100 dark:border-neutral-800 rounded-2xl p-4 mb-4">
+          <p className="text-sm font-medium text-gray-900 dark:text-white mb-3">Work Mode</p>
+          <div className="flex rounded-xl bg-gray-100 dark:bg-neutral-800 p-1">
+            <button
+              type="button"
+              onClick={() => setWorkMode('on_site')}
+              className={`flex-1 py-2.5 px-4 text-sm font-medium rounded-lg transition-all duration-200 ${
+                workMode === 'on_site'
+                  ? 'bg-white dark:bg-neutral-700 text-gray-900 dark:text-white shadow-sm'
+                  : 'text-gray-500 dark:text-neutral-400 hover:text-gray-700 dark:hover:text-neutral-200'
+              }`}
+            >
+              🏢 On-Site
+            </button>
+            <button
+              type="button"
+              onClick={() => setWorkMode('wfh')}
+              className={`flex-1 py-2.5 px-4 text-sm font-medium rounded-lg transition-all duration-200 ${
+                workMode === 'wfh'
+                  ? 'bg-white dark:bg-neutral-700 text-gray-900 dark:text-white shadow-sm'
+                  : 'text-gray-500 dark:text-neutral-400 hover:text-gray-700 dark:hover:text-neutral-200'
+              }`}
+            >
+              🏠 Work From Home
+            </button>
+          </div>
+          {workMode === 'wfh' && (
+            <p className="text-xs text-gray-500 dark:text-neutral-400 mt-2">
+              Location verification will be skipped for WFH mode.
+            </p>
+          )}
+        </div>
+      )}
 
+      {/* WFH Active Work Timer */}
+      {todayRecord?.workMode === 'wfh' && todayRecord?.clockIn && !todayRecord?.clockOut && (
+        <div className="bg-white dark:bg-neutral-900 border border-gray-100 dark:border-neutral-800 rounded-2xl p-4 mb-4">
+          <div className="flex items-center justify-between mb-2">
+            <p className="text-sm font-medium text-gray-900 dark:text-white">Active Work Time</p>
+            <span className="text-xs text-gray-500 dark:text-neutral-400">
+              Target: {formatDuration(WFH_TARGET_SECONDS / 3600)}
+            </span>
+          </div>
+          <div className="flex items-baseline gap-2">
+            <span className="text-3xl font-mono font-bold text-gray-900 dark:text-white">
+              {formatDuration(wfhActiveSeconds / 3600)}
+            </span>
+            <span className="text-sm text-gray-500 dark:text-neutral-400">
+              / {formatDuration(WFH_TARGET_SECONDS / 3600)}
+            </span>
+          </div>
+          <div className="mt-3 w-full bg-gray-200 dark:bg-neutral-700 rounded-full h-2">
+            <div
+              className="bg-brand h-2 rounded-full transition-all duration-1000"
+              style={{ width: `${Math.min(100, (wfhActiveSeconds / WFH_TARGET_SECONDS) * 100)}%` }}
+            ></div>
+          </div>
+          <p className="text-xs text-gray-500 dark:text-neutral-400 mt-2">
+            {Math.round((wfhActiveSeconds / WFH_TARGET_SECONDS) * 100)}% of daily target
+          </p>
 
-{/* Action Buttons */}
+          {/* Break Duration Timer */}
+          {isOnBreak && (
+            <div className="mt-4 pt-4 border-t border-gray-100 dark:border-neutral-800">
+              <p className="text-sm font-medium text-orange-600 dark:text-orange-400 mb-1">Break Duration</p>
+              <span className="text-2xl font-mono font-bold text-orange-600 dark:text-orange-400">
+                {wfhBreakStart ? formatDuration((new Date().getTime() - wfhBreakStart.getTime()) / (1000 * 60 * 60)) : '0:00:00'}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Action Buttons */}
       <div className="space-y-4">
         {!todayRecord?.clockIn ? (
           <button
@@ -659,7 +790,7 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
             <span className="absolute inset-0 z-0 hidden dark:block bg-[radial-gradient(ellipse_at_top,rgba(255,255,255,0.15)_0%,transparent_70%)] opacity-0 group-hover:opacity-100 transition-opacity duration-700"></span>
             <span className="relative z-10 flex items-center justify-center tracking-wide dark:drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)]">
               <Play className="mr-2 h-5 w-5" />
-              <span>{isValidating ? 'Verifying Location & Network...' : loading ? 'Clocking In...' : 'Clock In'}</span>
+              <span>{isValidating ? 'Verifying Location & Network...' : loading ? 'Clocking In...' : workMode === 'wfh' ? 'Clock In (WFH)' : 'Clock In'}</span>
             </span>
           </button>
         ) : !todayRecord?.clockOut ? (

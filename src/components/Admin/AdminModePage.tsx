@@ -12,7 +12,8 @@ import {
   XCircle,
   AlertCircle,
   FileText,
-  Settings
+  Settings,
+  Monitor
 } from 'lucide-react';
 import { userService } from '../../services/userService';
 import { meetingService } from '../../services/meetingService';
@@ -21,6 +22,7 @@ import { format, parseISO, isToday } from 'date-fns';
 import toast from 'react-hot-toast';
 import LeaveManagement from './LeaveManagement';
 import WorkingHoursSettingsForm from './WorkingHoursSettingsForm';
+import WFHMonitoring from './WFHMonitoring';
 
 interface MeetingFormData {
   title: string;
@@ -32,7 +34,7 @@ interface MeetingFormData {
 
 const AdminModePage: React.FC = () => {
   const { user } = useAuth();
-  const [activeTab, setActiveTab] = useState<'meetings' | 'leaves' | 'working-hours'>('meetings');
+  const [activeTab, setActiveTab] = useState<'meetings' | 'leaves' | 'working-hours' | 'wfh'>('meetings');
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
@@ -262,6 +264,18 @@ const AdminModePage: React.FC = () => {
             <div className="flex items-center space-x-2">
               <Settings className="h-4 w-4" />
               <span>Working Hours</span>
+            </div>
+          </button>
+          <button
+            onClick={() => setActiveTab('wfh')}
+            className={`py-2 px-1 border-b-2 font-medium text-sm ${activeTab === 'wfh'
+              ? 'border-slate-900 dark:border-neutral-200 text-slate-900 dark:text-white font-semibold'
+              : 'border-transparent text-gray-500 dark:text-neutral-400 hover:text-gray-700 dark:hover:text-neutral-300 hover:border-gray-300 dark:hover:border-neutral-700'
+              }`}
+          >
+            <div className="flex items-center space-x-2">
+              <Monitor className="h-4 w-4" />
+              <span>WFH Monitoring</span>
             </div>
           </button>
         </nav>
@@ -616,6 +630,7 @@ const AdminModePage: React.FC = () => {
       )}
       {activeTab === 'leaves' && <LeaveManagement />}
       {activeTab === 'working-hours' && <WorkingHoursSettingsForm />}
+      {activeTab === 'wfh' && <WFHMonitoring />}
     </div>
   );
 };
