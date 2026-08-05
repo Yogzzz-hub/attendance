@@ -324,7 +324,7 @@ const WFHMonitoring: React.FC = () => {
                   WFH Activity Timeline
                 </h3>
                 <p className="text-sm text-gray-500 dark:text-neutral-400 mt-1">
-                  {selectedRecord.employeeName} • {format(parseDDMMYYYY(selectedDate), 'MMMM dd, yyyy')}
+                  {selectedRecord.employeeName} • {format(parseDDMMYYYY(selectedDate) || new Date(), 'MMMM dd, yyyy')}
                 </p>
               </div>
               <button
