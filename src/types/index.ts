@@ -93,8 +93,31 @@ export interface BreakTime {
   endTime?: Date; // Alternative field name for consistency
   reason?: string;
   type?: 'break' | 'lunch';
+  breakType?: string; // e.g. 'short_break', 'tea', 'lunch'
   duration?: number;
 }
+
+export interface SoftwareUsageLog {
+  id: string;
+  attendanceRecordId: string;
+  userId: string;
+  softwareName: string;
+  windowTitle?: string;
+  category: 'development' | 'communication' | 'browsing' | 'productivity' | 'design' | 'office' | 'general' | 'other';
+  durationSeconds: number;
+  activityPercentage: number;
+  recordedAt: Date;
+  createdAt?: Date;
+}
+
+export interface SoftwareUsageSummary {
+  softwareName: string;
+  category: string;
+  totalSeconds: number;
+  avgActivityPercentage: number;
+  logCount: number;
+}
+
 
 export interface GeolocationData {
   latitude: number;

@@ -3,6 +3,21 @@
  */
 
 /**
+ * Detect if running in local development environment (localhost, 127.0.0.1, or Vite DEV mode)
+ */
+export const isLocalEnvironment = (): boolean => {
+  if (typeof window === 'undefined') return false;
+  const hostname = window.location.hostname;
+  return (
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname === '[::1]' ||
+    hostname.endsWith('.local') ||
+    Boolean(import.meta.env?.DEV)
+  );
+};
+
+/**
  * Calculate distance between two coordinates using Haversine formula
  * @returns Distance in meters
  */
@@ -44,43 +59,76 @@ export const getClientIP = async (): Promise<string | null> => {
 };
 
 /**
+ * Check if an IP matches office subnet or local development
+ */
+export const isOfficeSubnetOrLocal = (ip: string, allowedIP: string): boolean => {
+  if (isLocalEnvironment()) return true;
+  if (!ip) return false;
+
+  // Local loopbacks
+  if (ip === '127.0.0.1' || ip === '::1' || ip === 'localhost') return true;
+
+  // If allowed IP is configured as local/loopback
+  if (allowedIP === '127.0.0.1' || allowedIP === 'localhost') return true;
+
+  // Support wildcard matching for subnets (e.g., 192.168.1.* or 10.*)
+  if (allowedIP.includes('*')) {
+    const allowedPattern = allowedIP.replace(/\./g, '\\.').replace(/\*/g, '.*');
+    const regex = new RegExp(`^${allowedPattern}$`);
+    return regex.test(ip);
+  }
+
+  return ip === allowedIP;
+};
+
+/**
  * Verify client IP address against allowed office IP
  */
-export const verifyIPAddress = async (allowedIP: string): Promise<{ valid: boolean; ip: string | null }> => {
+export const verifyIPAddress = async (allowedIP: string): Promise<{ valid: boolean; ip: string | null; isLocalOrSubnet?: boolean }> => {
   try {
+    if (isLocalEnvironment()) {
+      return { valid: true, ip: '127.0.0.1', isLocalOrSubnet: true };
+    }
+
     const clientIP = await getClientIP();
-    
     if (!clientIP) {
+      if (isLocalEnvironment() || allowedIP === '127.0.0.1') {
+        return { valid: true, ip: '127.0.0.1', isLocalOrSubnet: true };
+      }
       return { valid: false, ip: null };
     }
-    
-    // Support wildcard matching for subnets (e.g., 192.168.1.*)
-    if (allowedIP.includes('*')) {
-      const allowedPattern = allowedIP.replace(/\./g, '\\.').replace(/\*/g, '.*');
-      const regex = new RegExp(`^${allowedPattern}$`);
-      return { valid: regex.test(clientIP), ip: clientIP };
-    }
-    
-    return { valid: clientIP === allowedIP, ip: clientIP };
+
+    const matches = isOfficeSubnetOrLocal(clientIP, allowedIP);
+    return { valid: matches, ip: clientIP, isLocalOrSubnet: matches };
   } catch (error) {
     console.error('IP verification failed:', error);
+    if (isLocalEnvironment()) {
+      return { valid: true, ip: '127.0.0.1', isLocalOrSubnet: true };
+    }
     return { valid: false, ip: null };
   }
 };
 
 /**
- * Validate geofence location
+ * Validate geofence location with optional localhost / dev bypass or network override
  */
 export const verifyGeofence = (
   currentLat: number,
   currentLon: number,
   officeLat: number,
   officeLon: number,
-  allowedRadiusMeters: number
-): { valid: boolean; distance: number } => {
+  allowedRadiusMeters: number,
+  options?: { allowLocalhostBypass?: boolean; officeNetworkVerified?: boolean }
+): { valid: boolean; distance: number; isDevBypass?: boolean; isNetworkVerified?: boolean } => {
   const distance = calculateDistance(currentLat, currentLon, officeLat, officeLon);
+  const allowLocal = options?.allowLocalhostBypass ?? true;
+  const isDev = allowLocal && isLocalEnvironment();
+  const isNetVerified = Boolean(options?.officeNetworkVerified);
+
   return {
-    valid: distance <= allowedRadiusMeters,
-    distance: Math.round(distance)
+    valid: isDev || isNetVerified || distance <= allowedRadiusMeters,
+    distance: Math.round(distance),
+    isDevBypass: isDev,
+    isNetworkVerified: isNetVerified
   };
 };

@@ -5,10 +5,12 @@ import {
   Coffee,
   Activity,
   Search,
-  X
+  X,
+  Layers
 } from 'lucide-react';
 import { format } from 'date-fns';
 import { globalAttendanceService } from '../../services/globalAttendanceService';
+import { SoftwareUsageSummary } from '../../types';
 import { formatToDDMMYYYY, parseDDMMYYYY } from '../../utils/dateUtils';
 import { formatDuration } from '../../utils/formatDuration';
 import toast from 'react-hot-toast';
@@ -41,6 +43,7 @@ const WFHMonitoring: React.FC = () => {
   // Detail drawer state
   const [selectedRecord, setSelectedRecord] = useState<WFHDailySummary | null>(null);
   const [activityLogs, setActivityLogs] = useState<WFHActivityLog[]>([]);
+  const [softwareSummary, setSoftwareSummary] = useState<SoftwareUsageSummary[]>([]);
   const [loadingLogs, setLoadingLogs] = useState(false);
 
   const loadWFHData = useCallback(async () => {
@@ -64,11 +67,15 @@ const WFHMonitoring: React.FC = () => {
     setSelectedRecord(record);
     setLoadingLogs(true);
     try {
-      const logs = await globalAttendanceService.getWFHActivityLogs(record.attendanceRecordId);
+      const [logs, software] = await Promise.all([
+        globalAttendanceService.getWFHActivityLogs(record.attendanceRecordId),
+        globalAttendanceService.getSoftwareUsageSummary(record.attendanceRecordId)
+      ]);
       setActivityLogs(logs);
+      setSoftwareSummary(software);
     } catch (error) {
       console.error('Failed to load activity logs:', error);
-      toast.error('Failed to load activity timeline');
+      toast.error('Failed to load activity timeline and software usage');
     } finally {
       setLoadingLogs(false);
     }
@@ -77,6 +84,7 @@ const WFHMonitoring: React.FC = () => {
   const closeDrawer = () => {
     setSelectedRecord(null);
     setActivityLogs([]);
+    setSoftwareSummary([]);
   };
 
   const formatSeconds = (seconds: number): string => {
@@ -335,15 +343,72 @@ const WFHMonitoring: React.FC = () => {
               </button>
             </div>
 
-            <div className="p-6 overflow-y-auto flex-1">
+            <div className="p-6 overflow-y-auto flex-1 space-y-6">
+              {/* Software & Tools Tracked Section */}
+              <div>
+                <div className="flex items-center justify-between mb-3">
+                  <h4 className="text-sm font-semibold text-gray-900 dark:text-white flex items-center gap-2">
+                    <Layers className="w-4 h-4 text-brand" />
+                    Software & Tools Tracked Today
+                  </h4>
+                  <span className="text-xs text-gray-500 dark:text-neutral-400">
+                    {softwareSummary.length} {softwareSummary.length === 1 ? 'application' : 'applications'}
+                  </span>
+                </div>
+
+                {softwareSummary.length > 0 ? (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {softwareSummary.map((item, idx) => {
+                      const hours = (item.totalSeconds / 3600).toFixed(1);
+                      const minutes = Math.round(item.totalSeconds / 60);
+                      return (
+                        <div
+                          key={idx}
+                          className="p-3 rounded-xl bg-gray-50 dark:bg-neutral-800/60 border border-gray-200/80 dark:border-neutral-700/60 flex flex-col justify-between"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <span className="font-semibold text-sm text-gray-900 dark:text-white truncate">
+                              {item.softwareName}
+                            </span>
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-brand/10 text-brand capitalize">
+                              {item.category}
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between text-xs text-gray-500 dark:text-neutral-400 mt-2">
+                            <span>
+                              {hours !== '0.0' ? `${hours} hrs` : `${minutes} min`} ({item.logCount} logs)
+                            </span>
+                            <span className="font-medium text-emerald-600 dark:text-emerald-400">
+                              {Math.round(item.avgActivityPercentage)}% active
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="p-4 rounded-xl bg-gray-50 dark:bg-neutral-800/40 border border-dashed border-gray-200 dark:border-neutral-800 text-center">
+                    <p className="text-xs text-gray-500 dark:text-neutral-400">
+                      No software usage logs reported yet for this session.
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* Activity Timeline */}
+              <div className="border-t border-gray-100 dark:border-neutral-800 pt-4">
+                <h4 className="text-sm font-semibold text-gray-900 dark:text-white mb-3 flex items-center gap-2">
+                  <Activity className="w-4 h-4 text-blue-500" />
+                  Activity Timeline
+                </h4>
               {loadingLogs ? (
                 <div className="flex items-center justify-center py-12">
                   <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900"></div>
                 </div>
               ) : activityLogs.length === 0 ? (
-                <div className="text-center py-12">
-                  <Activity className="w-12 h-12 text-gray-300 mx-auto mb-4" />
-                  <p className="text-gray-500 dark:text-neutral-400">No activity logs recorded for this shift</p>
+                <div className="text-center py-8">
+                  <Activity className="w-10 h-10 text-gray-300 mx-auto mb-2" />
+                  <p className="text-xs text-gray-500 dark:text-neutral-400">No activity logs recorded for this shift</p>
                 </div>
               ) : (
                 <div className="space-y-4">
@@ -389,6 +454,7 @@ const WFHMonitoring: React.FC = () => {
                   </div>
                 </div>
               )}
+              </div>
             </div>
           </div>
         </div>

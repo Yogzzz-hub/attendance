@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback, memo } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Clock, Calendar, TrendingUp, CalendarPlus } from 'lucide-react';
+import { Clock, Calendar, TrendingUp, CalendarPlus, Monitor, Plus, RefreshCw } from 'lucide-react';
 import { useAuth } from '../../hooks/useAuth';
 import { globalAttendanceService } from '../../services/globalAttendanceService';
 import { meetingService } from '../../services/meetingService';
+import { SoftwareUsageSummary } from '../../types';
+import toast from 'react-hot-toast';
 
 import { format } from 'date-fns';
 import { getOfficeNow, formatOffice } from '../../utils/timezoneUtils';
@@ -40,6 +42,79 @@ const EmployeeDashboardNew: React.FC = () => {
     },
     enabled: !!employee,
   });
+
+  // ✅ Software Usage Modal & Tracking State
+  const [showLogSoftwareModal, setShowLogSoftwareModal] = useState(false);
+  const [softwareForm, setSoftwareForm] = useState<{
+    name: string;
+    category: 'development' | 'communication' | 'browsing' | 'productivity' | 'design' | 'office' | 'general' | 'other';
+    minutes: number;
+  }>({
+    name: '',
+    category: 'development',
+    minutes: 30,
+  });
+  const [submittingSoftware, setSubmittingSoftware] = useState(false);
+
+  // ✅ TanStack Query: Software & Tools Usage Summary for Today
+  const { data: softwareSummary = [], isLoading: softwareLoading, refetch: refetchSoftware, isRefetching: isSoftwareRefetching } = useQuery<SoftwareUsageSummary[]>({
+    queryKey: ['softwareUsageSummary', todayRecord?.id],
+    queryFn: async () => {
+      if (!todayRecord?.id) return [];
+      return globalAttendanceService.getSoftwareUsageSummary(todayRecord.id);
+    },
+    enabled: !!todayRecord?.id,
+    refetchInterval: 30000, // Background poll every 30s so desktop agent logs appear automatically
+  });
+
+  const handleLogSoftware = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!todayRecord?.id || !softwareForm.name.trim()) return;
+
+    setSubmittingSoftware(true);
+    try {
+      await globalAttendanceService.logSoftwareUsage({
+        attendanceId: todayRecord.id,
+        softwareName: softwareForm.name.trim(),
+        category: softwareForm.category,
+        durationSeconds: Math.max(1, softwareForm.minutes) * 60,
+        activityScore: 100,
+      });
+      toast.success(`Logged ${softwareForm.name.trim()} (${softwareForm.minutes}m)`);
+      setShowLogSoftwareModal(false);
+      setSoftwareForm({ name: '', category: 'development', minutes: 30 });
+      queryClient.invalidateQueries({ queryKey: ['softwareUsageSummary', todayRecord.id] });
+      queryClient.invalidateQueries({ queryKey: ['employeeAttendanceToday', employee?.id] });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to log software');
+    } finally {
+      setSubmittingSoftware(false);
+    }
+  };
+
+  const getCategoryBadgeClass = (category: string) => {
+    switch (category.toLowerCase()) {
+      case 'development':
+        return 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800/60';
+      case 'browsing':
+        return 'bg-blue-50 text-blue-700 dark:bg-blue-950/50 dark:text-blue-300 border border-blue-200 dark:border-blue-800/60';
+      case 'communication':
+        return 'bg-purple-50 text-purple-700 dark:bg-purple-950/50 dark:text-purple-300 border border-purple-200 dark:border-purple-800/60';
+      case 'productivity':
+      case 'office':
+        return 'bg-amber-50 text-amber-700 dark:bg-amber-950/50 dark:text-amber-300 border border-amber-200 dark:border-amber-800/60';
+      case 'design':
+        return 'bg-pink-50 text-pink-700 dark:bg-pink-950/50 dark:text-pink-300 border border-pink-200 dark:border-pink-800/60';
+      default:
+        return 'bg-gray-100 text-gray-700 dark:bg-neutral-800 dark:text-neutral-300 border border-gray-200 dark:border-neutral-700';
+    }
+  };
+
+  const totalSoftwareSeconds = softwareSummary.reduce((acc, item) => acc + item.totalSeconds, 0);
+  const totalActiveSeconds = Math.max(todayRecord?.activeSeconds || 0, totalSoftwareSeconds);
+  const avgOverallActivity = softwareSummary.length > 0
+    ? Math.round(softwareSummary.reduce((acc, item) => acc + item.avgActivityPercentage, 0) / softwareSummary.length)
+    : 100;
 
   // ✅ TanStack Query: Weekly attendance statistics
   const { data: weeklyStats, isLoading: weeklyLoading } = useQuery({
@@ -307,11 +382,14 @@ const EmployeeDashboardNew: React.FC = () => {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Clock In/Out Section */}
         <div className="space-y-6">
-          <ClockInOutNew onAttendanceChange={() => {
-            queryClient.invalidateQueries({ queryKey: ['employeeAttendanceToday', employee?.id] });
-            queryClient.invalidateQueries({ queryKey: ['employeeWeeklyStats', employee?.id] });
-            queryClient.invalidateQueries({ queryKey: ['attendanceRecords'] });
-          }} />
+          <ClockInOutNew
+            todayRecord={todayRecord}
+            onAttendanceChange={() => {
+              queryClient.invalidateQueries({ queryKey: ['employeeAttendanceToday', employee?.id] });
+              queryClient.invalidateQueries({ queryKey: ['employeeWeeklyStats', employee?.id] });
+              queryClient.invalidateQueries({ queryKey: ['attendanceRecords'] });
+            }}
+          />
         </div>
 
         {/* Today's Status & Upcoming Meetings */}
@@ -323,17 +401,29 @@ const EmployeeDashboardNew: React.FC = () => {
             <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-sm text-gray-600 dark:text-neutral-400">Status</span>
-                <span className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${!todayRecord?.clockIn
-                  ? 'text-gray-600 dark:text-neutral-400 bg-gray-100'
-                  : todayRecord?.isLate
-                    ? 'text-yellow-600 bg-yellow-50'
-                    : 'text-green-600 bg-green-50'
+                <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium ${!todayRecord?.clockIn
+                  ? 'text-gray-600 dark:text-neutral-400 bg-gray-100 dark:bg-neutral-800'
+                  : todayRecord?.clockOut
+                    ? 'text-blue-700 bg-blue-50 dark:bg-blue-950/40 dark:text-blue-400'
+                    : (todayRecord?.breaks?.some(b => !b.endTime && !b.end))
+                      ? 'text-amber-700 bg-amber-50 dark:bg-amber-950/40 dark:text-amber-400'
+                      : (todayRecord?.lunchStart && !todayRecord?.lunchEnd)
+                        ? 'text-orange-700 bg-orange-50 dark:bg-orange-950/40 dark:text-orange-400'
+                        : todayRecord?.isLate
+                          ? 'text-yellow-700 bg-yellow-50 dark:bg-yellow-950/40 dark:text-yellow-400'
+                          : 'text-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 dark:text-emerald-400'
                   }`}>
                   {!todayRecord?.clockIn
                     ? 'Not clocked in'
-                    : todayRecord?.isLate
-                      ? 'Late arrival'
-                      : 'On time'
+                    : todayRecord?.clockOut
+                      ? 'Shift completed'
+                      : (todayRecord?.breaks?.some(b => !b.endTime && !b.end))
+                        ? 'On Break'
+                        : (todayRecord?.lunchStart && !todayRecord?.lunchEnd)
+                          ? 'Lunch Break'
+                          : todayRecord?.isLate
+                            ? 'Late arrival'
+                            : 'On time'
                   }
                 </span>
               </div>
@@ -372,6 +462,129 @@ const EmployeeDashboardNew: React.FC = () => {
                 </>
               )}
             </div>
+          </div>
+
+          {/* Software & Tools Used Today */}
+          <div className="bg-white dark:bg-neutral-900 rounded-2xl shadow-sm border border-gray-100 dark:border-neutral-800 p-6">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 bg-brand/10 dark:bg-brand/20 rounded-xl text-brand">
+                  <Monitor className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Software & Tools Used Today</h3>
+                  <p className="text-xs text-gray-500 dark:text-neutral-400">
+                    Screen time & tool activity breakdown
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => refetchSoftware()}
+                  disabled={softwareLoading || isSoftwareRefetching}
+                  className="p-1.5 rounded-lg text-gray-500 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors"
+                  title="Refresh software logs"
+                >
+                  <RefreshCw className={`h-4 w-4 ${softwareLoading || isSoftwareRefetching ? 'animate-spin text-brand' : ''}`} />
+                </button>
+
+                {todayRecord?.clockIn && !todayRecord?.clockOut && (
+                  <button
+                    type="button"
+                    onClick={() => setShowLogSoftwareModal(true)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl bg-brand text-white hover:bg-brand/90 dark:bg-white dark:text-black dark:hover:bg-gray-100 transition-all shadow-sm"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    Log Tool
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Active Screen Time Banner */}
+            {todayRecord?.clockIn && (
+              <div className="grid grid-cols-2 gap-3 p-3.5 mb-4 rounded-xl bg-gray-50 dark:bg-neutral-800/50 border border-gray-100 dark:border-neutral-800">
+                <div>
+                  <span className="text-[11px] uppercase tracking-wider font-semibold text-gray-500 dark:text-neutral-400">
+                    Active Screen Time
+                  </span>
+                  <p className="text-xl font-mono font-bold text-gray-900 dark:text-white mt-0.5">
+                    {formatDuration(totalActiveSeconds / 3600)}
+                  </p>
+                </div>
+                <div className="text-right">
+                  <span className="text-[11px] uppercase tracking-wider font-semibold text-gray-500 dark:text-neutral-400">
+                    Avg Activity Rate
+                  </span>
+                  <p className="text-xl font-mono font-bold text-emerald-600 dark:text-emerald-400 mt-0.5">
+                    {avgOverallActivity}%
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Software List */}
+            {softwareLoading ? (
+              <div className="text-center py-6">
+                <div className="animate-spin rounded-full h-6 w-6 border-2 border-gray-300 border-t-brand mx-auto mb-2"></div>
+                <p className="text-xs text-gray-500 dark:text-neutral-400">Loading tools & usage data...</p>
+              </div>
+            ) : softwareSummary.length > 0 ? (
+              <div className="space-y-3">
+                {softwareSummary.map((tool, idx) => {
+                  const sharePercentage = totalSoftwareSeconds > 0
+                    ? Math.round((tool.totalSeconds / totalSoftwareSeconds) * 100)
+                    : 0;
+
+                  return (
+                    <div
+                      key={idx}
+                      className="p-3 rounded-xl bg-gray-50/70 dark:bg-neutral-800/40 border border-gray-100 dark:border-neutral-800 hover:border-gray-200 dark:hover:border-neutral-700 transition-all"
+                    >
+                      <div className="flex items-center justify-between mb-1.5">
+                        <div className="flex items-center gap-2">
+                          <span className="font-semibold text-sm text-gray-900 dark:text-white">
+                            {tool.softwareName}
+                          </span>
+                          <span className={`px-2 py-0.5 text-[10px] font-semibold rounded-full uppercase tracking-wider ${getCategoryBadgeClass(tool.category)}`}>
+                            {tool.category}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-sm font-bold text-gray-900 dark:text-white">
+                            {formatDuration(tool.totalSeconds / 3600)}
+                          </span>
+                          <span className="text-xs text-emerald-600 dark:text-emerald-400 font-medium">
+                            {tool.avgActivityPercentage}% active
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="w-full bg-gray-200 dark:bg-neutral-700 rounded-full h-1.5 overflow-hidden">
+                        <div
+                          className="bg-brand h-1.5 rounded-full transition-all duration-700"
+                          style={{ width: `${Math.max(4, Math.min(100, sharePercentage))}%` }}
+                        ></div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : todayRecord?.clockIn ? (
+              <div className="p-4 rounded-xl bg-gray-50 dark:bg-neutral-800/30 text-center border border-dashed border-gray-200 dark:border-neutral-800">
+                <p className="text-xs text-gray-600 dark:text-neutral-400 leading-relaxed">
+                  No software usage recorded yet today. Run the desktop agent (<code className="text-brand font-mono text-[11px]">python wfh_agent.py</code>) or click <strong>Log Tool</strong> to track tools manually.
+                </p>
+              </div>
+            ) : (
+              <div className="p-4 rounded-xl bg-gray-50 dark:bg-neutral-800/30 text-center border border-dashed border-gray-200 dark:border-neutral-800">
+                <p className="text-xs text-gray-500 dark:text-neutral-400">
+                  Clock in to start tracking software usage and active screen time.
+                </p>
+              </div>
+            )}
           </div>
 
           {/* Upcoming Meetings */}
@@ -472,6 +685,92 @@ const EmployeeDashboardNew: React.FC = () => {
         isOpen={isLeaveModalOpen}
         onClose={() => setIsLeaveModalOpen(false)}
       />
+
+      {/* Log Software Usage Modal */}
+      {showLogSoftwareModal && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-neutral-900 rounded-2xl shadow-xl max-w-md w-full p-6 border border-gray-100 dark:border-neutral-800">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-1">Log Software / Tool Usage</h3>
+            <p className="text-xs text-gray-500 dark:text-neutral-400 mb-4">
+              Record tools and active time spent during your shift.
+            </p>
+
+            <form onSubmit={handleLogSoftware} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-gray-700 dark:text-neutral-300 mb-1">
+                  Software / Tool Name
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. VS Code, Google Chrome, Figma, Slack"
+                  value={softwareForm.name}
+                  onChange={(e) => setSoftwareForm({ ...softwareForm, name: e.target.value })}
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-gray-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-brand"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold text-gray-700 dark:text-neutral-300 mb-1">
+                    Category
+                  </label>
+                  <select
+                    value={softwareForm.category}
+                    onChange={(e) => setSoftwareForm({
+                      ...softwareForm,
+                      category: e.target.value as typeof softwareForm.category
+                    })}
+                    className="w-full px-3 py-2.5 rounded-xl border border-gray-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-brand"
+                  >
+                    <option value="development">Development</option>
+                    <option value="browsing">Browsing</option>
+                    <option value="communication">Communication</option>
+                    <option value="productivity">Productivity</option>
+                    <option value="design">Design</option>
+                    <option value="office">Office</option>
+                    <option value="general">General</option>
+                    <option value="other">Other</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-gray-700 dark:text-neutral-300 mb-1">
+                    Duration (Minutes)
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="720"
+                    required
+                    value={softwareForm.minutes}
+                    onChange={(e) => setSoftwareForm({ ...softwareForm, minutes: parseInt(e.target.value, 10) || 1 })}
+                    className="w-full px-3 py-2.5 rounded-xl border border-gray-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-brand"
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2.5 pt-3">
+                <button
+                  type="button"
+                  onClick={() => setShowLogSoftwareModal(false)}
+                  disabled={submittingSoftware}
+                  className="px-4 py-2 rounded-xl text-sm font-medium text-gray-700 dark:text-neutral-300 hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={submittingSoftware || !softwareForm.name.trim()}
+                  className="px-5 py-2 rounded-xl text-sm font-semibold bg-brand text-white hover:bg-brand/90 dark:bg-white dark:text-black dark:hover:bg-gray-100 transition-all disabled:opacity-50"
+                >
+                  {submittingSoftware ? 'Saving...' : 'Save Usage'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -1,0 +1,9 @@
+{
+  "employee_id": "00000000-0000-0000-0000-000000000000",
+  "hostname": "EMPLOYEE-LAPTOP-01",
+  "work_mode": "wfh",
+  "supabase_url": "",
+  "supabase_anon_key": "",
+  "silent": true,
+  "log_file": "agent.log"
+}

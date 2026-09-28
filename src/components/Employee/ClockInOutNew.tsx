@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef, memo } from 'react';
 import { useQueryClient, useMutation } from '@tanstack/react-query';
-import { Clock, AlertCircle, Coffee, Play, Pause } from 'lucide-react';
+import { Clock, AlertCircle, Coffee, Play, Pause, Monitor, Plus, MapPin, Building2, Home, Wifi, RotateCcw, ShieldCheck } from 'lucide-react';
 import { globalAttendanceService } from '../../services/globalAttendanceService';
-import { AttendanceRecord } from '../../types';
+import { AttendanceRecord, SoftwareUsageSummary } from '../../types';
 import type { RoleSchedule } from '../../types';
 import { useAuth } from '../../hooks/useAuth';
 import { formatOfficeTimeLong, getOfficeNow } from '../../utils/timezoneUtils';
@@ -11,7 +11,7 @@ import toast from 'react-hot-toast';
 import { getLunchEndTime, isLateArrival, DEFAULT_ROLE_SCHEDULE } from '../../constants/workingHours';
 import { configService } from '../../services/configService';
 import { formatDuration } from '../../utils/formatDuration';
-import { getClientIP, verifyIPAddress, verifyGeofence } from '../../utils/security';
+import { verifyGeofence, calculateDistance, isLocalEnvironment, verifyIPAddress } from '../../utils/security';
 import { envConfig } from '../../config/env';
 
 // ─── Isolated micro-components: tick every second without triggering parent re-renders ───
@@ -92,11 +92,12 @@ LiveBreakDuration.displayName = 'LiveBreakDuration';
 
 interface ClockInOutNewProps {
   onAttendanceChange?: () => void;
+  todayRecord?: AttendanceRecord | null;
 }
 
-const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => {
+const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange, todayRecord: propTodayRecord }) => {
   const { employee } = useAuth();
-  const [todayRecord, setTodayRecord] = useState<AttendanceRecord | null>(null);
+  const [todayRecord, setTodayRecord] = useState<AttendanceRecord | null>(propTodayRecord ?? null);
   const [loading, setLoading] = useState(false);
   // currentTime removed — clock display is now handled by <LiveClockDisplay />
   const [isOnBreak, setIsOnBreak] = useState(false);
@@ -104,10 +105,18 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
   const [lateReason, setLateReason] = useState('');
   const [pendingClockIn, setPendingClockIn] = useState(false);
   const [currentLocation, setCurrentLocation] = useState<{ latitude: number; longitude: number; accuracy?: number } | null>(null);
+  const [officeDistance, setOfficeDistance] = useState<number | null>(null);
   const [locationError, setLocationError] = useState<string | null>(null);
   const [isValidating, setIsValidating] = useState(false);
   const [showClockOutModal, setShowClockOutModal] = useState(false);
-  const [isInitializing, setIsInitializing] = useState(true);
+  const [isInitializing, setIsInitializing] = useState(!propTodayRecord);
+
+  // Network & Dev verification state
+  const [isOfficeNetworkVerified, setIsOfficeNetworkVerified] = useState(false);
+  const [isDevBypassActive, setIsDevBypassActive] = useState(isLocalEnvironment());
+  const [isCheckingNetwork, setIsCheckingNetwork] = useState(false);
+  const [clientPublicIP, setClientPublicIP] = useState<string | null>(null);
+
   // Active employee schedule (fetched from DB); falls back to DEFAULT_ROLE_SCHEDULE while loading or on error
   const [activeSchedule, setActiveSchedule] = useState<RoleSchedule | null>(null);
   const [lunchEndTime, setLunchEndTime] = useState<Date>(getLunchEndTime(DEFAULT_ROLE_SCHEDULE, new Date()));
@@ -123,6 +132,20 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
   const clockInLock = useRef(false);
   // Stores the location that passed geofence validation, protecting against stale state updates before modal submission
   const validatedLocationRef = useRef<{ latitude: number; longitude: number; accuracy: number } | null>(null);
+
+  // Software usage monitoring state
+  const [softwareSummary, setSoftwareSummary] = useState<SoftwareUsageSummary[]>([]);
+  const [loadingSoftware, setLoadingSoftware] = useState(false);
+  const [showLogSoftwareModal, setShowLogSoftwareModal] = useState(false);
+  const [softwareForm, setSoftwareForm] = useState<{
+    name: string;
+    category: 'development' | 'communication' | 'browsing' | 'productivity' | 'design' | 'office' | 'general' | 'other';
+    minutes: number;
+  }>({
+    name: '',
+    category: 'development',
+    minutes: 30
+  });
 
   const queryClient = useQueryClient();
 
@@ -159,85 +182,202 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
     }
   }, [queryClient, employee?.id, onAttendanceChange]);
 
-  // Helper: Fetch a fresh GPS reading with high accuracy
-  const getFreshLocation = (): Promise<{ latitude: number; longitude: number; accuracy: number } | null> => {
-    return new Promise((resolve) => {
-      if (!navigator.geolocation) {
-        resolve(null);
-        return;
+  /**
+   * Verify whether the user's connection matches the office network/subnet or localhost
+   */
+  const checkOfficeNetwork = useCallback(async (): Promise<boolean> => {
+    setIsCheckingNetwork(true);
+    try {
+      const isLocal = isLocalEnvironment();
+      if (isLocal) {
+        setIsOfficeNetworkVerified(true);
+        setIsDevBypassActive(true);
+        setLocationError(null);
+        toast.success('Localhost / Dev network recognized: Geofence bypass active.');
+        return true;
       }
+
+      const ipResult = await verifyIPAddress(envConfig.officeIpAddress);
+      setClientPublicIP(ipResult.ip);
+
+      if (ipResult.valid) {
+        setIsOfficeNetworkVerified(true);
+        setLocationError(null);
+        toast.success(`Office Network Verified (${ipResult.ip || 'Gateway'})`);
+        return true;
+      } else {
+        toast.error(`Your network IP (${ipResult.ip || 'unknown'}) does not match the office network (${envConfig.officeIpAddress}).`);
+        return false;
+      }
+    } catch (err) {
+      console.error('Failed to verify office network:', err);
+      toast.error('Network verification failed');
+      return false;
+    } finally {
+      setIsCheckingNetwork(false);
+    }
+  }, []);
+
+  /**
+   * Validate Geolocation strictly for On-Site clock-in, with localhost dev bypass and network verification fallback.
+   */
+  const validateOnSiteLocation = async (options?: { forceGPS?: boolean }): Promise<{ latitude: number; longitude: number; accuracy: number; distance: number }> => {
+    const isLocal = isLocalEnvironment();
+
+    // 1. Localhost / Dev Bypass: automatically allow if running on localhost unless explicitly forced
+    if (isLocal && !options?.forceGPS) {
+      setIsDevBypassActive(true);
+      setLocationError(null);
+      const mockCoords = {
+        latitude: currentLocation?.latitude || envConfig.officeLatitude,
+        longitude: currentLocation?.longitude || envConfig.officeLongitude,
+        accuracy: 10,
+        distance: 0,
+      };
+      setOfficeDistance(0);
+      return mockCoords;
+    }
+
+    // 2. Office Network / Subnet Override
+    if (isOfficeNetworkVerified && !options?.forceGPS) {
+      setLocationError(null);
+      return {
+        latitude: currentLocation?.latitude || envConfig.officeLatitude,
+        longitude: currentLocation?.longitude || envConfig.officeLongitude,
+        accuracy: currentLocation?.accuracy || 15,
+        distance: officeDistance ?? 0,
+      };
+    }
+
+    if (!navigator.geolocation) {
+      if (isLocal || isOfficeNetworkVerified) {
+        return {
+          latitude: envConfig.officeLatitude,
+          longitude: envConfig.officeLongitude,
+          accuracy: 20,
+          distance: 0,
+        };
+      }
+      const err = 'Geolocation is not supported by your browser. Please verify via office network or use a modern browser.';
+      setLocationError(err);
+      throw new Error(err);
+    }
+
+    return new Promise((resolve, reject) => {
       navigator.geolocation.getCurrentPosition(
         (position) => {
           const { latitude, longitude, accuracy } = position.coords;
-          resolve({ latitude, longitude, accuracy });
+          const officeLat = envConfig.officeLatitude;
+          const officeLon = envConfig.officeLongitude;
+          const allowedRadius = envConfig.geofenceRadiusMeters;
+
+          const geoCheck = verifyGeofence(
+            latitude,
+            longitude,
+            officeLat,
+            officeLon,
+            allowedRadius,
+            {
+              allowLocalhostBypass: true,
+              officeNetworkVerified: isOfficeNetworkVerified
+            }
+          );
+
+          setOfficeDistance(geoCheck.distance);
+          setCurrentLocation({ latitude, longitude, accuracy });
+
+          if (geoCheck.isDevBypass) {
+            setIsDevBypassActive(true);
+            setLocationError(null);
+            resolve({ latitude, longitude, accuracy, distance: geoCheck.distance });
+            return;
+          }
+
+          if (geoCheck.isNetworkVerified) {
+            setLocationError(null);
+            resolve({ latitude, longitude, accuracy, distance: geoCheck.distance });
+            return;
+          }
+
+          if (!geoCheck.valid) {
+            const outOfBoundsErr = `Out of bounds: You are ${geoCheck.distance}m away from the office. You must be within ${allowedRadius}m to clock in on-site.`;
+            setLocationError(outOfBoundsErr);
+            reject(new Error(outOfBoundsErr));
+            return;
+          }
+
+          setLocationError(null);
+          resolve({ latitude, longitude, accuracy, distance: geoCheck.distance });
         },
-        () => resolve(null),
+        (error) => {
+          // If GPS fails but user is on localhost / dev, handle gracefully
+          if (isLocal) {
+            setIsDevBypassActive(true);
+            setLocationError(null);
+            resolve({
+              latitude: envConfig.officeLatitude,
+              longitude: envConfig.officeLongitude,
+              accuracy: 10,
+              distance: 0,
+            });
+            return;
+          }
+
+          let errorMsg = 'Failed to acquire location for on-site verification.';
+          switch (error.code) {
+            case error.PERMISSION_DENIED:
+              errorMsg = 'Location permission denied. Please allow location access in your browser settings or verify via office network.';
+              break;
+            case error.POSITION_UNAVAILABLE:
+              errorMsg = 'Location information is unavailable. Ensure GPS is enabled or verify via office network.';
+              break;
+            case error.TIMEOUT:
+              errorMsg = 'Location request timed out. Please retry with high accuracy GPS or verify via office network.';
+              break;
+            default:
+              errorMsg = error.message || errorMsg;
+              break;
+          }
+          setLocationError(errorMsg);
+          reject(new Error(errorMsg));
+        },
         { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
       );
     });
   };
 
-  /**
-   * Validate IP and Geolocation constraints before allowing clock-in
-   * Fetches current settings from database (Admin-configurable)
-   */
-  const validateLocationConstraints = async (): Promise<void> => {
-    // Fetch current validation settings from database
-    // Default to true (strict) if fetch fails - security-first approach
-    let requireIpMatch = true;
-    let requireGeoMatch = true;
-
+  const handleRetryGPS = async () => {
+    setLocationError(null);
+    setIsValidating(true);
     try {
-      const config = await configService.getWorkingHoursConfig();
-      if (config) {
-        requireIpMatch = config.require_ip_match ?? true;
-        requireGeoMatch = config.require_geo_match ?? true;
-      }
-    } catch (error) {
-      console.warn('Failed to fetch validation config, using strict defaults:', error);
+      await validateOnSiteLocation({ forceGPS: true });
+      toast.success('High-accuracy GPS location acquired!');
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'GPS lock failed');
+    } finally {
+      setIsValidating(false);
     }
+  };
 
-    // IP Address Validation
-    if (requireIpMatch) {
-      const clientIP = await getClientIP();
-      const ipCheck = await verifyIPAddress(envConfig.officeIpAddress);
-
-      if (!ipCheck.valid) {
-        throw new Error(
-          'You must be on the office network to clock in. '
-          + (clientIP ? `` : 'Unable to determine your IP address.')
-        );
-      }
-    }
-
-    // Geolocation Validation
-    if (requireGeoMatch) {
-      const freshLocation = await getFreshLocation();
-      if (!freshLocation) {
-        throw new Error('Unable to acquire a fresh GPS lock. Please check your location permissions and try again.');
-      }
-
-      const geoCheck = verifyGeofence(
-        freshLocation.latitude,
-        freshLocation.longitude,
-        envConfig.officeLatitude,
-        envConfig.officeLongitude,
-        envConfig.geofenceRadiusMeters
-      );
-
-      if (!geoCheck.valid) {
-        throw new Error(
-          `You must be within the office premises to clock in. `
-          + `You are ${geoCheck.distance} meters away from the office.`
-        );
-      }
-
-      // Update UI with the verified location (including accuracy)
-      setCurrentLocation({ latitude: freshLocation.latitude, longitude: freshLocation.longitude, accuracy: freshLocation.accuracy });
+  const handleWorkModeChange = (mode: 'on_site' | 'wfh') => {
+    setWorkMode(mode);
+    if (mode === 'wfh') {
       setLocationError(null);
-
-      // Store the validated location for the actual clock-in call (protects against stale state)
-      validatedLocationRef.current = freshLocation;
+    } else if (currentLocation) {
+      const dist = Math.round(
+        calculateDistance(
+          currentLocation.latitude,
+          currentLocation.longitude,
+          envConfig.officeLatitude,
+          envConfig.officeLongitude
+        )
+      );
+      setOfficeDistance(dist);
+      if (dist <= envConfig.geofenceRadiusMeters) {
+        setLocationError(null);
+      } else {
+        setLocationError(`You are ${dist}m away from the office (allowed: ${envConfig.geofenceRadiusMeters}m).`);
+      }
     }
   };
 
@@ -249,9 +389,18 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
 
     try {
       setIsValidating(true);
-      // Skip location/network validation for WFH mode
-      if (workMode !== 'wfh') {
-        await validateLocationConstraints();
+      setLocationError(null);
+
+      // 1. Conditional Location Validation:
+      // If workMode is 'on_site': Strictly require browser geolocation, calculate distance, and block clock-in
+      // If workMode is 'wfh': Completely skip geolocation and distance checks
+      if (workMode === 'on_site') {
+        const validatedLoc = await validateOnSiteLocation();
+        validatedLocationRef.current = validatedLoc;
+      } else {
+        // WFH Mode: completely skip geolocation and distance checks
+        setLocationError(null);
+        validatedLocationRef.current = null;
       }
 
       // Check if it would be a late arrival based on configured work start time
@@ -269,8 +418,9 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
 
       await performClockIn();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Location validation failed');
-      setLocationError(error instanceof Error ? error.message : 'Location validation failed');
+      const msg = error instanceof Error ? error.message : 'Clock-in failed';
+      toast.error(msg);
+      setLocationError(msg);
     } finally {
       setIsValidating(false);
       if (!goingToModal) {
@@ -284,8 +434,8 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
 
     setLoading(true);
     try {
-      // Use the validated location if available; otherwise fall back to current state
-      const validatedLoc = validatedLocationRef.current;
+      // Use validated coords for on_site mode; skip completely for wfh
+      const validatedLoc = workMode === 'on_site' ? validatedLocationRef.current : null;
       const locationPayload = validatedLoc
         ? {
           latitude: validatedLoc.latitude,
@@ -293,7 +443,7 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
           accuracy: validatedLoc.accuracy,
           timestamp: new Date()
         }
-        : currentLocation
+        : (workMode === 'on_site' && currentLocation)
           ? {
             latitude: currentLocation.latitude,
             longitude: currentLocation.longitude,
@@ -310,7 +460,8 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
         workMode
       );
       setTodayRecord(record);
-      toast.success('Clocked in successfully!');
+      queryClient.setQueryData(['employeeAttendanceToday', employee.id], record);
+      toast.success(workMode === 'wfh' ? 'Clocked in successfully (Work From Home)!' : 'Clocked in successfully (On-Site)!');
 
       if (record.isLate) {
         toast.error(`Late arrival: ${record.lateReason}`);
@@ -327,6 +478,48 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
       // Notify parent component of change
       handleAttendanceChange();
     } catch (error) {
+      const err = error as Error & { code?: string; existingRecord?: AttendanceRecord };
+      const errMsg = err?.message || '';
+      const isAlreadyClockedIn =
+        err?.code === 'ALREADY_CLOCKED_IN' ||
+        errMsg.toLowerCase().includes('already clocked in') ||
+        errMsg.toLowerCase().includes('duplicate key') ||
+        errMsg.toLowerCase().includes('unique constraint') ||
+        errMsg.includes('23505');
+
+      if (isAlreadyClockedIn) {
+        let activeRecord = err.existingRecord;
+        if (!activeRecord && employee?.id) {
+          try {
+            activeRecord = (await globalAttendanceService.getTodayAttendance(employee.id)) || undefined;
+          } catch (fetchErr) {
+            console.error('Failed to retrieve existing record after duplicate clock-in:', fetchErr);
+          }
+        }
+
+        if (activeRecord) {
+          setTodayRecord(activeRecord);
+          const onBreak = activeRecord.breaks.some(b => !b.endTime && !b.end);
+          setIsOnBreak(onBreak);
+          if (activeRecord.workMode) {
+            setWorkMode(activeRecord.workMode as 'on_site' | 'wfh');
+          }
+
+          // Synchronize TanStack Query cache so parent dashboard reflects clocked-in state immediately
+          queryClient.setQueryData(['employeeAttendanceToday', employee.id], activeRecord);
+          handleAttendanceChange();
+
+          toast.success('Session synchronized: You are already clocked in for today.');
+
+          // Reset modal state
+          setShowLateReasonModal(false);
+          setLateReason('');
+          setPendingClockIn(false);
+          validatedLocationRef.current = null;
+          return;
+        }
+      }
+
       toast.error(error instanceof Error ? error.message : 'Clock in failed');
       // Note: keep validatedLocationRef intact so a retry (e.g., after network error) can reuse same location
     } finally {
@@ -366,36 +559,39 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
     clockOutMutation.mutate();
   };
 
-  const handleStartBreak = async () => {
+  const handleTakeBreak = async () => {
     if (!employee?.id) return;
 
     setLoading(true);
     try {
-      const record = await globalAttendanceService.startBreak(employee.id);
+      const record = await globalAttendanceService.takeBreak(employee.id);
       setTodayRecord(record);
       setIsOnBreak(true);
-      toast.success('Break started');
+      toast.success('Break started: Work paused');
 
-      // Notify parent component of change
+      queryClient.setQueryData(['employeeAttendanceToday', employee.id], record);
       handleAttendanceChange();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Start break failed');
+      toast.error(error instanceof Error ? error.message : 'Take break failed');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleEndBreak = async () => {
+  const handleResumeWork = async () => {
     if (!employee?.id) return;
 
     setLoading(true);
     try {
-      const record = await globalAttendanceService.endBreak(employee.id);
+      const record = await globalAttendanceService.resumeWork(employee.id);
       setTodayRecord(record);
       setIsOnBreak(false);
-      toast.success('Break ended');
+      toast.success('Work resumed!');
+
+      queryClient.setQueryData(['employeeAttendanceToday', employee.id], record);
+      handleAttendanceChange();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'End break failed');
+      toast.error(error instanceof Error ? error.message : 'Resume work failed');
     } finally {
       setLoading(false);
     }
@@ -417,49 +613,141 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
   // getWorkingHours and getCurrentBreakDuration removed — now handled by
   // <LiveWorkingHours /> and <LiveBreakDuration /> micro-components
 
-  // Get user location (background refresh – actual clock-in uses fresh GPS)
+  // Synchronize with parent todayRecord prop whenever it changes
   useEffect(() => {
+    if (propTodayRecord !== undefined) {
+      setTodayRecord(propTodayRecord);
+      setIsInitializing(false);
+      if (propTodayRecord) {
+        const onBreak = propTodayRecord.breaks?.some(b => !b.endTime && !b.end) || false;
+        setIsOnBreak(onBreak);
+        if (propTodayRecord.workMode) {
+          setWorkMode(propTodayRecord.workMode as 'on_site' | 'wfh');
+        }
+      }
+    }
+  }, [propTodayRecord]);
+
+  // Background location acquisition for On-Site mode only
+  useEffect(() => {
+    if (workMode !== 'on_site' || todayRecord?.clockIn) return;
+
     const requestLocation = () => {
+      if (isLocalEnvironment()) {
+        setIsDevBypassActive(true);
+      }
+
       if (navigator.geolocation) {
         navigator.geolocation.getCurrentPosition(
           (position) => {
             const { latitude, longitude, accuracy } = position.coords;
             setCurrentLocation({ latitude, longitude, accuracy });
-            setLocationError(null);
-            console.log('📍 Location obtained:', latitude, longitude, `accuracy: ${accuracy}m`);
+            const dist = Math.round(
+              calculateDistance(
+                latitude,
+                longitude,
+                envConfig.officeLatitude,
+                envConfig.officeLongitude
+              )
+            );
+            setOfficeDistance(dist);
+            if (isLocalEnvironment() || isOfficeNetworkVerified || dist <= envConfig.geofenceRadiusMeters) {
+              setLocationError(null);
+            } else {
+              setLocationError(`You are ${dist}m away from the office (allowed: ${envConfig.geofenceRadiusMeters}m).`);
+            }
           },
           (error) => {
-            console.error('📍 Location error:', error);
-            setLocationError(`Location access denied: ${error.message}`);
+            if (isLocalEnvironment()) {
+              setIsDevBypassActive(true);
+              setLocationError(null);
+            } else if (error.code === error.PERMISSION_DENIED) {
+              setLocationError('Location permission denied. Please allow location access or verify via office network.');
+            }
           },
-          { enableHighAccuracy: true, timeout: 10000, maximumAge: 300000 }
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
         );
-      } else {
-        setLocationError('Geolocation is not supported by this browser');
       }
     };
 
     requestLocation();
-
-    // Update location every 5 minutes
-    const locationInterval = setInterval(requestLocation, 5 * 60 * 1000);
-
+    const locationInterval = setInterval(requestLocation, 30000);
     return () => clearInterval(locationInterval);
-  }, []);
+  }, [workMode, todayRecord?.clockIn, isOfficeNetworkVerified]);
 
   // Fetch today's attendance record on mount (or when employee changes)
   // fetchTodayRecord is defined OUTSIDE useEffect so it gets a stable reference
   const fetchTodayRecord = useCallback(async () => {
-    if (!employee?.id) return;
-
-    const record = await globalAttendanceService.getTodayAttendance(employee.id);
-    if (record) {
-      setTodayRecord(record);
-      const onBreak = record.breaks.some(breakSession => !breakSession.endTime);
-      setIsOnBreak(onBreak);
+    if (!employee?.id) {
+      setIsInitializing(false);
+      return;
     }
-    setIsInitializing(false);
-  }, [employee?.id]);
+
+    try {
+      const record = await globalAttendanceService.getTodayAttendance(employee.id);
+      if (record) {
+        setTodayRecord(record);
+        const onBreak = record.breaks?.some(breakSession => !breakSession.endTime && !breakSession.end) || false;
+        setIsOnBreak(onBreak);
+        if (record.workMode) {
+          setWorkMode(record.workMode as 'on_site' | 'wfh');
+        }
+        // Keep TanStack Query cache in sync
+        queryClient.setQueryData(['employeeAttendanceToday', employee.id], record);
+      } else {
+        setTodayRecord(null);
+        setIsOnBreak(false);
+      }
+    } catch (err) {
+      console.error('Failed to fetch today attendance on mount:', err);
+    } finally {
+      setIsInitializing(false);
+    }
+  }, [employee?.id, queryClient]);
+
+  // Load software usage summary for today's active session
+  const loadSoftwareSummary = useCallback(async (recordId: string) => {
+    try {
+      setLoadingSoftware(true);
+      const summary = await globalAttendanceService.getSoftwareUsageSummary(recordId);
+      setSoftwareSummary(summary);
+    } catch (err) {
+      console.error('Failed to load software usage summary:', err);
+    } finally {
+      setLoadingSoftware(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (todayRecord?.id) {
+      loadSoftwareSummary(todayRecord.id);
+    } else {
+      setSoftwareSummary([]);
+    }
+  }, [todayRecord?.id, loadSoftwareSummary]);
+
+  const handleLogSoftware = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!todayRecord?.id || !softwareForm.name.trim()) return;
+
+    try {
+      await globalAttendanceService.logSoftwareUsage({
+        attendanceId: todayRecord.id,
+        softwareName: softwareForm.name.trim(),
+        category: softwareForm.category,
+        durationSeconds: Math.max(1, softwareForm.minutes) * 60,
+        activityScore: 100
+      });
+      toast.success(`Logged ${softwareForm.name.trim()} usage`);
+      setShowLogSoftwareModal(false);
+      setSoftwareForm({ name: '', category: 'development', minutes: 30 });
+      if (todayRecord.id) {
+        await loadSoftwareSummary(todayRecord.id);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to log software');
+    }
+  };
 
   useEffect(() => {
     if (!employee?.id) {
@@ -684,57 +972,207 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
         </div>
       )}
 
-      {/* Location / Work Mode Status */}
-      <div className="bg-white dark:bg-neutral-900 border border-gray-100 dark:border-neutral-800 rounded-2xl p-4 mb-4">
-        <div className="flex items-center">
-          <div className={`h-2 w-2 rounded-full mr-2 ${workMode === 'wfh' ? 'bg-blue-500' : currentLocation ? 'bg-green-500' : 'bg-red-500'}`}></div>
-          <div>
-            <p className="text-sm font-medium text-gray-900 dark:text-white dark:text-white">
-              {workMode === 'wfh' ? 'Work From Home Mode' : 'Location Status'}
-            </p>
-            <p className="text-sm text-gray-600 dark:text-neutral-400">
-              {workMode === 'wfh'
-                ? '🏠 Location verification skipped for WFH'
-                : currentLocation
-                  ? `📍 Location detected (${currentLocation.latitude.toFixed(6)}, ${currentLocation.longitude.toFixed(6)})`
-                  : locationError || 'Location access required for attendance'}
-            </p>
+      {/* Active Shift Mode Badge (When already clocked in) */}
+      {todayRecord?.clockIn && (
+        <div className="flex items-center justify-between bg-gray-50 dark:bg-neutral-800/50 border border-gray-100 dark:border-neutral-800 rounded-xl px-4 py-2.5 mb-4">
+          <span className="text-xs font-medium text-gray-500 dark:text-neutral-400">Current Work Mode</span>
+          <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold ${
+            todayRecord.workMode === 'wfh'
+              ? 'bg-blue-100 text-blue-800 dark:bg-blue-950/60 dark:text-blue-300'
+              : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+          }`}>
+            {todayRecord.workMode === 'wfh' ? (
+              <>
+                <Home className="w-3.5 h-3.5" />
+                Work From Home
+              </>
+            ) : (
+              <>
+                <Building2 className="w-3.5 h-3.5" />
+                On-Site Office
+              </>
+            )}
+          </span>
+        </div>
+      )}
+
+      {/* 1. Mode Selector (Always visible before clock-in) */}
+      {!todayRecord?.clockIn && (
+        <div className="bg-gray-50 dark:bg-neutral-800/60 rounded-2xl p-4 mb-4 border border-gray-100 dark:border-neutral-800">
+          <div className="flex items-center justify-between mb-2.5">
+            <span className="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-neutral-400">
+              Select Work Mode
+            </span>
+            <span className="text-xs font-medium text-brand">
+              {workMode === 'on_site' ? '🏢 Office Geofenced' : '🏠 Remote Attendance'}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 p-1 bg-gray-200/80 dark:bg-neutral-900 rounded-xl">
+            <button
+              id="mode-on-site-btn"
+              type="button"
+              onClick={() => handleWorkModeChange('on_site')}
+              className={`flex items-center justify-center gap-2 py-3 px-4 rounded-lg font-medium text-sm transition-all duration-200 ${
+                workMode === 'on_site'
+                  ? 'bg-white dark:bg-neutral-800 text-gray-900 dark:text-white shadow-sm ring-1 ring-black/5 dark:ring-white/10 font-semibold'
+                  : 'text-gray-600 dark:text-neutral-400 hover:text-gray-900 dark:hover:text-white'
+              }`}
+            >
+              <Building2 className="w-4 h-4" />
+              <span>On-Site</span>
+            </button>
+
+            <button
+              id="mode-wfh-btn"
+              type="button"
+              onClick={() => handleWorkModeChange('wfh')}
+              className={`flex items-center justify-center gap-2 py-3 px-4 rounded-lg font-medium text-sm transition-all duration-200 ${
+                workMode === 'wfh'
+                  ? 'bg-white dark:bg-neutral-800 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-blue-500/20 font-semibold'
+                  : 'text-gray-600 dark:text-neutral-400 hover:text-gray-900 dark:hover:text-white'
+              }`}
+            >
+              <Home className="w-4 h-4" />
+              <span>Work From Home</span>
+            </button>
           </div>
         </div>
-      </div>
+      )}
 
-      {/* Work Mode Selector */}
+      {/* 2. Conditional Location / Geofence Banner */}
       {!todayRecord?.clockIn && (
-        <div className="bg-white dark:bg-neutral-900 border border-gray-100 dark:border-neutral-800 rounded-2xl p-4 mb-4">
-          <p className="text-sm font-medium text-gray-900 dark:text-white mb-3">Work Mode</p>
-          <div className="flex rounded-xl bg-gray-100 dark:bg-neutral-800 p-1">
-            <button
-              type="button"
-              onClick={() => setWorkMode('on_site')}
-              className={`flex-1 py-2.5 px-4 text-sm font-medium rounded-lg transition-all duration-200 ${
-                workMode === 'on_site'
-                  ? 'bg-white dark:bg-neutral-700 text-gray-900 dark:text-white shadow-sm'
-                  : 'text-gray-500 dark:text-neutral-400 hover:text-gray-700 dark:hover:text-neutral-200'
-              }`}
-            >
-              🏢 On-Site
-            </button>
-            <button
-              type="button"
-              onClick={() => setWorkMode('wfh')}
-              className={`flex-1 py-2.5 px-4 text-sm font-medium rounded-lg transition-all duration-200 ${
-                workMode === 'wfh'
-                  ? 'bg-white dark:bg-neutral-700 text-gray-900 dark:text-white shadow-sm'
-                  : 'text-gray-500 dark:text-neutral-400 hover:text-gray-700 dark:hover:text-neutral-200'
-              }`}
-            >
-              🏠 Work From Home
-            </button>
-          </div>
-          {workMode === 'wfh' && (
-            <p className="text-xs text-gray-500 dark:text-neutral-400 mt-2">
-              Location verification will be skipped for WFH mode.
-            </p>
+        <div className={`rounded-xl p-4 mb-4 border transition-all ${
+          workMode === 'wfh'
+            ? 'bg-blue-50/70 border-blue-200 dark:bg-blue-950/30 dark:border-blue-900/50'
+            : isDevBypassActive || isOfficeNetworkVerified || (officeDistance !== null && officeDistance <= envConfig.geofenceRadiusMeters)
+              ? 'bg-emerald-50/70 border-emerald-200 dark:bg-emerald-950/30 dark:border-emerald-900/50'
+              : locationError
+                ? 'bg-red-50/80 border-red-200 dark:bg-red-950/30 dark:border-red-900/50'
+                : 'bg-gray-50 dark:bg-neutral-800/40 border-gray-200 dark:border-neutral-800'
+        }`}>
+          {workMode === 'wfh' ? (
+            <div className="flex items-start gap-3">
+              <div className="p-2 rounded-lg bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400 mt-0.5">
+                <Home className="w-4 h-4" />
+              </div>
+              <div className="flex-1">
+                <p className="text-sm font-semibold text-blue-900 dark:text-blue-200">
+                  WFH Mode: Location Check Skipped
+                </p>
+                <p className="text-xs text-blue-700 dark:text-blue-300 mt-0.5 leading-relaxed">
+                  Remote attendance does not require office proximity or GPS verification. You can clock in directly from anywhere.
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-3">
+              <div className="flex items-start gap-3">
+                <div className={`p-2 rounded-lg mt-0.5 ${
+                  isDevBypassActive || isOfficeNetworkVerified || (officeDistance !== null && officeDistance <= envConfig.geofenceRadiusMeters)
+                    ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-400'
+                    : locationError
+                      ? 'bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400'
+                      : 'bg-gray-200 dark:bg-neutral-700 text-gray-700 dark:text-gray-300'
+                }`}>
+                  {isOfficeNetworkVerified ? <Wifi className="w-4 h-4" /> : <MapPin className="w-4 h-4" />}
+                </div>
+
+                <div className="flex-1">
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm font-semibold text-gray-900 dark:text-white">
+                      On-Site Location & Network Status
+                    </p>
+                    <span className={`text-xs font-semibold px-2 py-0.5 rounded ${
+                      isDevBypassActive
+                        ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'
+                        : isOfficeNetworkVerified
+                          ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200'
+                          : officeDistance !== null && officeDistance <= envConfig.geofenceRadiusMeters
+                            ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200'
+                            : 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
+                    }`}>
+                      {isDevBypassActive
+                        ? '⚡ Localhost Dev Bypass'
+                        : isOfficeNetworkVerified
+                          ? '📡 Office Network Verified'
+                          : officeDistance !== null
+                            ? `${officeDistance}m away (Max: ${envConfig.geofenceRadiusMeters}m)`
+                            : 'GPS Required'}
+                    </span>
+                  </div>
+
+                  <p className="text-xs text-gray-600 dark:text-neutral-400 mt-1 leading-relaxed">
+                    {isDevBypassActive ? (
+                      <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                        ✓ Localhost development environment recognized ({window.location.hostname}). Strict geofence requirement bypassed for testing.
+                      </span>
+                    ) : isOfficeNetworkVerified ? (
+                      <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                        ✓ Verified via Office Network ({clientPublicIP || 'Local Subnet'}). Ready to clock in!
+                      </span>
+                    ) : locationError ? (
+                      <span className="text-red-600 dark:text-red-400 font-medium">{locationError}</span>
+                    ) : officeDistance !== null && officeDistance <= envConfig.geofenceRadiusMeters ? (
+                      <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                        ✓ Within office geofence radius ({officeDistance}m / {envConfig.geofenceRadiusMeters}m). Ready to clock in!
+                      </span>
+                    ) : (
+                      <span>Acquiring GPS coordinates to verify office proximity...</span>
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              {/* Action Buttons for Override / Manual GPS Retry / Network Verification */}
+              <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-gray-100 dark:border-neutral-800/80">
+                <button
+                  type="button"
+                  onClick={handleRetryGPS}
+                  disabled={isValidating}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-white dark:bg-neutral-800 text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700 border border-gray-200 dark:border-neutral-700 transition-colors shadow-sm disabled:opacity-50"
+                >
+                  <RotateCcw className={`w-3.5 h-3.5 ${isValidating ? 'animate-spin' : ''}`} />
+                  Retry GPS
+                </button>
+
+                <button
+                  type="button"
+                  onClick={checkOfficeNetwork}
+                  disabled={isCheckingNetwork}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-white dark:bg-neutral-800 text-gray-700 dark:text-neutral-200 hover:bg-gray-100 dark:hover:bg-neutral-700 border border-gray-200 dark:border-neutral-700 transition-colors shadow-sm disabled:opacity-50"
+                >
+                  <Wifi className={`w-3.5 h-3.5 ${isCheckingNetwork ? 'animate-pulse text-brand' : ''}`} />
+                  {isCheckingNetwork ? 'Checking...' : 'Verify Office Network'}
+                </button>
+
+                {isLocalEnvironment() && !isDevBypassActive && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsDevBypassActive(true);
+                      setLocationError(null);
+                      toast.success('Localhost dev bypass activated');
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/60 border border-blue-200 dark:border-blue-800 transition-colors"
+                  >
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    Dev Bypass
+                  </button>
+                )}
+
+                {locationError && (
+                  <button
+                    type="button"
+                    onClick={() => handleWorkModeChange('wfh')}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-brand hover:underline transition-colors ml-auto"
+                  >
+                    <Home className="w-3.5 h-3.5" />
+                    Switch to WFH
+                  </button>
+                )}
+              </div>
+            </div>
           )}
         </div>
       )}
@@ -782,6 +1220,7 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
       <div className="space-y-4">
         {!todayRecord?.clockIn ? (
           <button
+            id="clock-in-btn"
             onClick={handleClockIn}
             disabled={loading || isValidating}
             className="relative group overflow-hidden w-full rounded-2xl bg-brand hover:bg-brand/90 text-white shadow-md dark:bg-white/[0.05] dark:hover:bg-white/[0.1] px-6 py-4 text-sm font-medium transition-all duration-500 ease-out border border-transparent dark:border-white/[0.1] dark:backdrop-blur-xl dark:shadow-[0_8px_32px_rgba(0,0,0,0.5),inset_0_4px_16px_rgba(255,255,255,0.15),inset_0_-4px_16px_rgba(0,0,0,0.4)] dark:hover:shadow-[0_8px_32px_rgba(0,0,0,0.6),inset_0_6px_20px_rgba(255,255,255,0.25),inset_0_-4px_16px_rgba(0,0,0,0.5)] disabled:opacity-50 disabled:cursor-not-allowed active:scale-[0.97]"
@@ -790,7 +1229,15 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
             <span className="absolute inset-0 z-0 hidden dark:block bg-[radial-gradient(ellipse_at_top,rgba(255,255,255,0.15)_0%,transparent_70%)] opacity-0 group-hover:opacity-100 transition-opacity duration-700"></span>
             <span className="relative z-10 flex items-center justify-center tracking-wide dark:drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)]">
               <Play className="mr-2 h-5 w-5" />
-              <span>{isValidating ? 'Verifying Location & Network...' : loading ? 'Clocking In...' : workMode === 'wfh' ? 'Clock In (WFH)' : 'Clock In'}</span>
+              <span>
+                {isValidating
+                  ? (workMode === 'on_site' ? 'Verifying Office Geofence...' : 'Validating...')
+                  : loading
+                    ? 'Clocking In...'
+                    : workMode === 'wfh'
+                      ? 'Clock In (Work From Home)'
+                      : 'Clock In (On-Site)'}
+              </span>
             </span>
           </button>
         ) : !todayRecord?.clockOut ? (
@@ -832,7 +1279,7 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
               <div className="flex space-x-3">
                 {!isOnBreak ? (
                   <button
-                    onClick={handleStartBreak}
+                    onClick={handleTakeBreak}
                     disabled={loading}
                     className="relative group overflow-hidden flex-1 rounded-2xl bg-white hover:bg-gray-50 text-gray-700 border border-gray-200 shadow-sm dark:bg-white/[0.05] dark:hover:bg-white/[0.1] px-6 py-4 text-sm font-medium dark:text-slate-200 transition-all duration-500 ease-out dark:border-white/[0.1] dark:backdrop-blur-xl dark:shadow-[0_8px_32px_rgba(0,0,0,0.5),inset_0_4px_16px_rgba(255,255,255,0.15),inset_0_-4px_16px_rgba(0,0,0,0.4)] dark:hover:shadow-[0_8px_32px_rgba(0,0,0,0.6),inset_0_6px_20px_rgba(255,255,255,0.25),inset_0_-4px_16px_rgba(0,0,0,0.5)] disabled:opacity-50 disabled:cursor-not-allowed active:scale-[0.97]"
                   >
@@ -840,20 +1287,20 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
                     <span className="absolute inset-0 z-0 hidden dark:block bg-[radial-gradient(ellipse_at_top,rgba(255,255,255,0.15)_0%,transparent_70%)] opacity-0 group-hover:opacity-100 transition-opacity duration-700"></span>
                     <span className="relative z-10 flex items-center justify-center tracking-wide dark:drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)]">
                       <Coffee className="mr-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 dark:text-slate-300 dark:group-hover:text-white transition-colors duration-300" />
-                      <span>{loading ? 'Starting...' : 'Start Break'}</span>
+                      <span>{loading ? 'Pausing...' : 'Take Break'}</span>
                     </span>
                   </button>
                 ) : (
                   <button
-                    onClick={handleEndBreak}
+                    onClick={handleResumeWork}
                     disabled={loading}
-                    className="relative group overflow-hidden flex-1 rounded-2xl bg-gray-900 hover:bg-black text-white shadow-md dark:bg-white/[0.1] dark:hover:bg-white/[0.15] px-6 py-4 text-sm font-medium transition-all duration-500 ease-out border border-transparent dark:border-white/[0.15] dark:backdrop-blur-xl dark:shadow-[0_8px_32px_rgba(0,0,0,0.5),inset_0_4px_16px_rgba(255,255,255,0.2),inset_0_-4px_16px_rgba(0,0,0,0.4)] dark:hover:shadow-[0_8px_32px_rgba(0,0,0,0.6),inset_0_6px_20px_rgba(255,255,255,0.3),inset_0_-4px_16px_rgba(0,0,0,0.5)] disabled:opacity-50 disabled:cursor-not-allowed active:scale-[0.97]"
+                    className="relative group overflow-hidden flex-1 rounded-2xl bg-emerald-600 hover:bg-emerald-700 text-white shadow-md dark:bg-emerald-600/80 dark:hover:bg-emerald-600 px-6 py-4 text-sm font-medium transition-all duration-500 ease-out border border-transparent dark:border-emerald-500/30 dark:backdrop-blur-xl dark:shadow-[0_8px_32px_rgba(16,185,129,0.3)] disabled:opacity-50 disabled:cursor-not-allowed active:scale-[0.97]"
                   >
                     <span className="absolute inset-x-0 top-0 h-px hidden dark:block bg-gradient-to-r from-transparent via-white/60 to-transparent opacity-60 group-hover:opacity-100 transition-opacity duration-500"></span>
                     <span className="absolute inset-0 z-0 hidden dark:block bg-[radial-gradient(ellipse_at_top,rgba(255,255,255,0.2)_0%,transparent_70%)] opacity-0 group-hover:opacity-100 transition-opacity duration-700"></span>
                     <span className="relative z-10 flex items-center justify-center tracking-wide dark:drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)]">
-                      <Pause className="mr-2 h-4 w-4" />
-                      <span>{loading ? 'Ending...' : <>End Break ({todayRecord?.breaks.find(b => !b.endTime)?.startTime ? <LiveBreakDuration breakStartTime={todayRecord!.breaks.find(b => !b.endTime)!.startTime!} /> : '0m'})</>}</span>
+                      <Play className="mr-2 h-4 w-4" />
+                      <span>{loading ? 'Resuming...' : <>Resume Work ({todayRecord?.breaks.find(b => !b.endTime && !b.end)?.startTime ? <LiveBreakDuration breakStartTime={todayRecord!.breaks.find(b => !b.endTime && !b.end)!.startTime!} /> : '0m'})</>}</span>
                     </span>
                   </button>
                 )}
@@ -871,7 +1318,7 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
               <span className="relative z-10 flex items-center justify-center tracking-wide dark:drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)]">
                 <Pause className="mr-2 h-5 w-5" />
                 <span>{loading ? 'Clocking Out...' :
-                  isOnBreak ? 'End Break First' :
+                  isOnBreak ? 'Resume Work First' :
                     (todayRecord?.lunchStart && !todayRecord?.lunchEnd) ? 'Return from Lunch First' : 'Clock Out'}</span>
               </span>
             </button>
@@ -943,6 +1390,60 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
               </>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Software & Tools Monitoring */}
+      {todayRecord?.clockIn && (
+        <div className="mt-6 border-t border-gray-100 dark:border-neutral-800 pt-4">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-medium text-gray-900 dark:text-white flex items-center gap-1.5">
+              <Monitor className="h-4 w-4 text-brand" />
+              Software & Tools Used Today
+            </h3>
+            <button
+              type="button"
+              onClick={() => setShowLogSoftwareModal(true)}
+              className="text-xs font-medium text-brand hover:underline inline-flex items-center gap-1"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              Log Tool
+            </button>
+          </div>
+
+          {loadingSoftware ? (
+            <div className="py-3 text-center text-xs text-gray-500 dark:text-neutral-400">
+              Loading software usage...
+            </div>
+          ) : softwareSummary.length > 0 ? (
+            <div className="space-y-2">
+              {softwareSummary.map((item, index) => (
+                <div
+                  key={index}
+                  className="flex items-center justify-between p-2.5 rounded-xl bg-gray-50 dark:bg-neutral-800/60 border border-gray-100 dark:border-neutral-800 text-xs"
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="font-semibold text-gray-900 dark:text-white">{item.softwareName}</span>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] uppercase font-medium tracking-wide bg-brand/10 text-brand">
+                      {item.category}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="font-mono text-gray-600 dark:text-neutral-300">
+                      {formatDuration(item.totalSeconds / 3600)}
+                    </span>
+                    <span className="text-[11px] text-gray-400">
+                      {item.avgActivityPercentage}% active
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="p-3 text-center rounded-xl bg-gray-50 dark:bg-neutral-800/40 text-xs text-gray-500 dark:text-neutral-400">
+              No software usage logged yet today. Tools tracked by the desktop agent or logged manually will appear here.
+            </div>
+          )}
         </div>
       )}
 
@@ -1019,6 +1520,86 @@ const ClockInOutNew: React.FC<ClockInOutNewProps> = ({ onAttendanceChange }) => 
                 Yes, Clock Out
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Log Software Modal */}
+      {showLogSoftwareModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white dark:bg-neutral-900 rounded-2xl p-6 w-full max-w-md shadow-xl border border-gray-100 dark:border-neutral-800">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2 flex items-center gap-2">
+              <Monitor className="h-5 w-5 text-brand" />
+              Log Software / Tool Used
+            </h3>
+            <p className="text-xs text-gray-500 dark:text-neutral-400 mb-4">
+              Record tools and software utilized during your work hours for productivity monitoring.
+            </p>
+            <form onSubmit={handleLogSoftware} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-gray-700 dark:text-neutral-300 mb-1">
+                  Software / Tool Name
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Visual Studio Code, Slack, Figma"
+                  value={softwareForm.name}
+                  onChange={(e) => setSoftwareForm(prev => ({ ...prev, name: e.target.value }))}
+                  className="w-full px-3 py-2 text-sm rounded-xl border border-gray-200 dark:border-neutral-700 bg-white dark:bg-black text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-brand"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 dark:text-neutral-300 mb-1">
+                    Category
+                  </label>
+                  <select
+                    value={softwareForm.category}
+                    onChange={(e) => setSoftwareForm(prev => ({ ...prev, category: e.target.value as any }))}
+                    className="w-full px-3 py-2 text-sm rounded-xl border border-gray-200 dark:border-neutral-700 bg-white dark:bg-black text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-brand"
+                  >
+                    <option value="development">Development</option>
+                    <option value="communication">Communication</option>
+                    <option value="browsing">Browsing</option>
+                    <option value="productivity">Productivity</option>
+                    <option value="design">Design</option>
+                    <option value="office">Office</option>
+                    <option value="general">General</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 dark:text-neutral-300 mb-1">
+                    Duration (Minutes)
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="720"
+                    value={softwareForm.minutes}
+                    onChange={(e) => setSoftwareForm(prev => ({ ...prev, minutes: parseInt(e.target.value, 10) || 1 }))}
+                    className="w-full px-3 py-2 text-sm rounded-xl border border-gray-200 dark:border-neutral-700 bg-white dark:bg-black text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-brand"
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-3 pt-3">
+                <button
+                  type="button"
+                  onClick={() => setShowLogSoftwareModal(false)}
+                  className="px-4 py-2 text-sm text-gray-600 dark:text-neutral-400 hover:bg-gray-100 dark:hover:bg-neutral-800 rounded-xl"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 text-sm font-medium text-white bg-brand hover:bg-brand/90 rounded-xl shadow-sm"
+                >
+                  Save Tool Log
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

@@ -1,4 +1,4 @@
-import { AttendanceRecord, GeolocationData } from '../types';
+import { AttendanceRecord, GeolocationData, SoftwareUsageLog, SoftwareUsageSummary } from '../types';
 import type { RoleSchedule } from '../types';
 import {
   toOfficeDateSafe,
@@ -124,6 +124,8 @@ class GlobalAttendanceService {
           startTime: toOfficeDateSafe(btData.start as string) || null,
           endTime: toOfficeDateSafe(btData.end as string) || null,
           type: (btData.type as string) || 'break',
+          breakType: (btData.break_type as string) || (btData.type as string) || 'short_break',
+          reason: (btData.reason as string) || undefined,
           duration: (btData.duration != null && btData.duration !== '') ? Number(btData.duration) : 0
         };
       }),
@@ -134,6 +136,8 @@ class GlobalAttendanceService {
           start: toOfficeDateSafe(btData.start as string) || null,
           end: toOfficeDateSafe(btData.end as string) || null,
           type: (btData.type as string) || 'break',
+          breakType: (btData.break_type as string) || (btData.type as string) || 'short_break',
+          reason: (btData.reason as string) || undefined,
           duration: (btData.duration != null && btData.duration !== '') ? Number(btData.duration) : 0
         };
       }),
@@ -183,13 +187,23 @@ class GlobalAttendanceService {
       // Check if already clocked in today
       const { data: existingRecord } = await supabase
         .from(this.ATTENDANCE_TABLE)
-        .select('login_time')
+        .select(`
+          *,
+          employees:user_id (name, email, employee_id, department, role),
+          attendance_breaks (*)
+        `)
         .eq('user_id', userId)
         .eq('date', todayIso)
         .maybeSingle();
 
       if (existingRecord?.login_time) {
-        throw new Error('Already clocked in today');
+        const alreadyError = new Error('Already clocked in today') as Error & {
+          code: string;
+          existingRecord: AttendanceRecord;
+        };
+        alreadyError.code = 'ALREADY_CLOCKED_IN';
+        alreadyError.existingRecord = this.convertDbToAttendance(existingRecord, schedule);
+        throw alreadyError;
       }
 
       // Create attendance record with SERVER TIMESTAMP
@@ -201,7 +215,24 @@ class GlobalAttendanceService {
         })
         .single();
 
-      if (insertError) throw insertError;
+      if (insertError) {
+        if (
+          insertError.message?.includes('duplicate key') ||
+          insertError.message?.includes('unique constraint') ||
+          insertError.code === '23505' ||
+          insertError.message?.toLowerCase().includes('already clocked in')
+        ) {
+          const fallback = await this.getTodayAttendance(userId);
+          const alreadyError = new Error('Already clocked in today') as Error & {
+            code: string;
+            existingRecord?: AttendanceRecord | null;
+          };
+          alreadyError.code = 'ALREADY_CLOCKED_IN';
+          alreadyError.existingRecord = fallback;
+          throw alreadyError;
+        }
+        throw insertError;
+      }
 
       const attendanceRecord = attendanceRecordRaw as ClockInRPCResult;
 
@@ -262,16 +293,37 @@ class GlobalAttendanceService {
 
       const todayIso = getOfficeTodayIso();
 
-      // Get attendance record ID for today
-      const { data: attendanceRecord, error: fetchError } = await supabase
+      // Get attendance record ID for today (or active unclosed session)
+      let { data: attendanceRecord, error: fetchError } = await supabase
         .from(this.ATTENDANCE_TABLE)
-        .select('id, login_time, logout_time, worked_hours')
+        .select('id, date, login_time, logout_time, worked_hours')
         .eq('user_id', userId)
         .eq('date', todayIso)
         .maybeSingle();
 
+      if (!attendanceRecord) {
+        // Fallback: search for any active unclosed session
+        const { data: openSession } = await supabase
+          .from(this.ATTENDANCE_TABLE)
+          .select('id, date, login_time, logout_time, worked_hours')
+          .eq('user_id', userId)
+          .is('logout_time', null)
+          .order('login_time', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (openSession) {
+          attendanceRecord = openSession;
+          fetchError = null;
+        }
+      }
+
       if (fetchError || !attendanceRecord) {
         throw new Error('No attendance record found for today');
+      }
+
+      if (attendanceRecord.logout_time) {
+        throw new Error('Already clocked out for today');
       }
 
       console.log('📋 Pre-update record:', {
@@ -294,16 +346,18 @@ class GlobalAttendanceService {
         throw new Error(`No schedule configured for role: ${role}`);
       }
 
+      const targetDate = (attendanceRecord.date as string) || todayIso;
+
       // Update via SECURITY DEFINER RPC with server-side validation
       console.log('🔄 Invoking clock_out RPC with params:', {
         p_user_id: userId,
-        p_date: todayIso,
+        p_date: targetDate,
         p_early_logout_reason: reason || null
       });
 
       const { data: rpcResultRaw, error: rpcError } = await supabase.rpc('clock_out', {
         p_user_id: userId,
-        p_date: todayIso,
+        p_date: targetDate,
         p_early_logout_reason: reason || null
       }).single();
 
@@ -386,12 +440,33 @@ class GlobalAttendanceService {
         .eq('date', todayIso)
         .maybeSingle();
 
-      if (error) {
-        if (error.code === 'PGRST116') return null;
-        throw error;
+      if (error && error.code !== 'PGRST116') {
+        console.warn('Error fetching today attendance by date:', error);
       }
 
-      return data ? this.convertDbToAttendance(data, schedule) : null;
+      let activeRow = data;
+      // Resilient Fallback: If no record found for today's ISO date, check for any unclosed session (logout_time IS NULL)
+      // or record created in the last 24 hours
+      if (!activeRow) {
+        const { data: openSession, error: openError } = await supabase
+          .from(this.ATTENDANCE_TABLE)
+          .select(`
+            *,
+            employees:user_id (name, email, employee_id, department, role),
+            attendance_breaks (*)
+          `)
+          .eq('user_id', userId)
+          .is('logout_time', null)
+          .order('login_time', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (!openError && openSession) {
+          activeRow = openSession;
+        }
+      }
+
+      return activeRow ? this.convertDbToAttendance(activeRow, schedule) : null;
     } catch (error) {
       console.error('Error getting today attendance:', error);
       return null;
@@ -978,7 +1053,10 @@ class GlobalAttendanceService {
     return this.isLateArrival(clockInTime, schedule) ? 'late' : 'present';
   }
 
-  async startBreak(userId: string): Promise<AttendanceRecord> {
+  /**
+   * Start a break ("Take Break")
+   */
+  async takeBreak(userId: string, breakType: string = 'short_break', reason?: string): Promise<AttendanceRecord> {
     try {
       const todayIso = getOfficeTodayIso();
       const now = new Date();
@@ -995,16 +1073,47 @@ class GlobalAttendanceService {
         schedule = { ...DEFAULT_ROLE_SCHEDULE, role };
       }
 
-      // Get attendance record
+      // Try RPC take_break first
+      try {
+        const { data: rpcData, error: rpcError } = await supabase.rpc('take_break', {
+          p_user_id: userId,
+          p_break_type: breakType,
+          p_reason: reason || null
+        });
+
+        if (!rpcError && rpcData?.attendance_record_id) {
+          const { data: updatedRecord, error: fetchError } = await supabase
+            .from(this.ATTENDANCE_TABLE)
+            .select(`
+              *,
+              employees:user_id (name, email, employee_id, department, role),
+              attendance_breaks (*)
+            `)
+            .eq('id', rpcData.attendance_record_id)
+            .single();
+
+          if (!fetchError && updatedRecord) {
+            return this.convertDbToAttendance(updatedRecord, schedule);
+          }
+        }
+      } catch (e) {
+        console.warn('RPC take_break failed or not found, falling back to direct table update:', e);
+      }
+
+      // Direct fallback
       const { data: attendanceRecord, error: recordError } = await supabase
         .from(this.ATTENDANCE_TABLE)
-        .select('id, login_time')
+        .select('id, login_time, logout_time')
         .eq('user_id', userId)
         .eq('date', todayIso)
         .maybeSingle();
 
       if (recordError || !attendanceRecord?.login_time) {
         throw new Error('Please clock in first');
+      }
+
+      if (attendanceRecord.logout_time) {
+        throw new Error('Already clocked out for today');
       }
 
       // Check for active break
@@ -1018,20 +1127,22 @@ class GlobalAttendanceService {
         throw new Error('A break is already in progress');
       }
 
-      // Start break with direct insert (no RPC)
+      // Start break with direct insert
       const { error: insertError } = await supabase
         .from(this.BREAKS_TABLE)
         .insert({
           attendance_record_id: attendanceRecord.id,
-          start: now.toISOString()
+          start: now.toISOString(),
+          break_type: breakType,
+          reason: reason || null
         })
         .select()
         .single();
 
       if (insertError) throw insertError;
 
-      // Get updated record (include role in join)
-      const { data: updatedRecord } = await supabase
+      // Get updated record
+      const { data: updatedRecord, error: fetchError } = await supabase
         .from(this.ATTENDANCE_TABLE)
         .select(`
           *,
@@ -1041,6 +1152,10 @@ class GlobalAttendanceService {
         .eq('id', attendanceRecord.id)
         .single();
 
+      if (fetchError || !updatedRecord) {
+        throw new Error('Failed to fetch updated attendance record after starting break');
+      }
+
       return this.convertDbToAttendance(updatedRecord, schedule);
     } catch (error) {
       console.error('Error starting break:', error);
@@ -1048,7 +1163,15 @@ class GlobalAttendanceService {
     }
   }
 
-  async endBreak(userId: string): Promise<AttendanceRecord> {
+  // Alias for backward compatibility
+  async startBreak(userId: string): Promise<AttendanceRecord> {
+    return this.takeBreak(userId, 'short_break');
+  }
+
+  /**
+   * Resume work from break ("Resume Work")
+   */
+  async resumeWork(userId: string): Promise<AttendanceRecord> {
     try {
       const todayIso = getOfficeTodayIso();
 
@@ -1064,22 +1187,49 @@ class GlobalAttendanceService {
         schedule = { ...DEFAULT_ROLE_SCHEDULE, role };
       }
 
-      // Get attendance record
+      // Try RPC resume_work first
+      try {
+        const { data: rpcData, error: rpcError } = await supabase.rpc('resume_work', {
+          p_user_id: userId
+        });
+
+        if (!rpcError && rpcData?.attendance_record_id) {
+          const { data: updatedRecord, error: fetchError } = await supabase
+            .from(this.ATTENDANCE_TABLE)
+            .select(`
+              *,
+              employees:user_id (name, email, employee_id, department, role),
+              attendance_breaks (*)
+            `)
+            .eq('id', rpcData.attendance_record_id)
+            .single();
+
+          if (!fetchError && updatedRecord) {
+            return this.convertDbToAttendance(updatedRecord, schedule);
+          }
+        }
+      } catch (e) {
+        console.warn('RPC resume_work failed or not found, falling back to direct table update:', e);
+      }
+
+      // Direct fallback
       const { data: attendanceRecord } = await supabase
         .from(this.ATTENDANCE_TABLE)
-        .select('id')
+        .select('id, break_seconds')
         .eq('user_id', userId)
         .eq('date', todayIso)
         .maybeSingle();
 
       if (!attendanceRecord) throw new Error('No attendance record found for today');
 
-      // Find active break (include start time for lunch detection)
+      // Find active break
       const { data: activeBreak } = await supabase
         .from(this.BREAKS_TABLE)
         .select('id, start')
         .eq('attendance_record_id', attendanceRecord.id)
         .is('end', null)
+        .order('start', { ascending: false })
+        .limit(1)
         .maybeSingle();
 
       if (!activeBreak) {
@@ -1090,13 +1240,23 @@ class GlobalAttendanceService {
       const { error: updateError } = await supabase
         .from(this.BREAKS_TABLE)
         .update({ end: now.toISOString() })
-        .eq('id', activeBreak.id)
-        .select()
-        .single();
+        .eq('id', activeBreak.id);
 
       if (updateError) throw updateError;
 
-      // Get updated record (include role in join)
+      // Update break_seconds on attendance_records row
+      if (activeBreak.start) {
+        const breakDurationSecs = Math.max(0, Math.round((now.getTime() - new Date(activeBreak.start).getTime()) / 1000));
+        await supabase
+          .from(this.ATTENDANCE_TABLE)
+          .update({
+            break_seconds: (attendanceRecord.break_seconds || 0) + breakDurationSecs,
+            updated_at: now.toISOString()
+          })
+          .eq('id', attendanceRecord.id);
+      }
+
+      // Get updated record
       const { data: updatedRecord, error: fetchError } = await supabase
         .from(this.ATTENDANCE_TABLE)
         .select(`
@@ -1107,13 +1267,150 @@ class GlobalAttendanceService {
         .eq('id', attendanceRecord.id)
         .maybeSingle();
 
-      if (fetchError) throw fetchError;
-      if (!updatedRecord) throw new Error('Failed to fetch updated attendance record');
+      if (fetchError || !updatedRecord) throw new Error('Failed to fetch updated attendance record');
 
       return this.convertDbToAttendance(updatedRecord, schedule);
     } catch (error) {
-      console.error('Error ending break:', error);
+      console.error('Error resuming work from break:', error);
       throw error;
+    }
+  }
+
+  // Alias for backward compatibility
+  async endBreak(userId: string): Promise<AttendanceRecord> {
+    return this.resumeWork(userId);
+  }
+
+  /**
+   * Log software/tool usage during work hours
+   */
+  async logSoftwareUsage(params: {
+    attendanceId: string;
+    softwareName: string;
+    windowTitle?: string;
+    category?: 'development' | 'communication' | 'browsing' | 'productivity' | 'design' | 'office' | 'general' | 'other';
+    durationSeconds?: number;
+    activityScore?: number;
+  }): Promise<void> {
+    try {
+      const { error } = await supabase.rpc('log_software_usage', {
+        p_attendance_id: params.attendanceId,
+        p_software_name: params.softwareName,
+        p_window_title: params.windowTitle || null,
+        p_category: params.category || 'general',
+        p_duration_seconds: params.durationSeconds ?? 60,
+        p_activity_score: params.activityScore ?? 100.0
+      });
+
+      if (error) {
+        // Direct table fallback
+        const { data: record } = await supabase
+          .from(this.ATTENDANCE_TABLE)
+          .select('user_id')
+          .eq('id', params.attendanceId)
+          .maybeSingle();
+
+        if (record?.user_id) {
+          await supabase.from('software_usage_logs').insert({
+            attendance_record_id: params.attendanceId,
+            user_id: record.user_id,
+            software_name: params.softwareName,
+            window_title: params.windowTitle || null,
+            category: params.category || 'general',
+            duration_seconds: params.durationSeconds ?? 60,
+            activity_percentage: params.activityScore ?? 100.0,
+            recorded_at: new Date().toISOString()
+          });
+        }
+      }
+    } catch (err) {
+      console.error('Failed to log software usage:', err);
+    }
+  }
+
+  /**
+   * Get raw software usage logs for an attendance session
+   */
+  async getSoftwareUsageLogs(attendanceRecordId: string): Promise<SoftwareUsageLog[]> {
+    try {
+      const { data, error } = await supabase
+        .from('software_usage_logs')
+        .select('*')
+        .eq('attendance_record_id', attendanceRecordId)
+        .order('recorded_at', { ascending: false });
+
+      if (error || !data) return [];
+      return data.map((d: Record<string, unknown>) => ({
+        id: d.id as string,
+        attendanceRecordId: d.attendance_record_id as string,
+        userId: d.user_id as string,
+        softwareName: d.software_name as string,
+        windowTitle: (d.window_title as string) || undefined,
+        category: (d.category as SoftwareUsageLog['category']) || 'general',
+        durationSeconds: (d.duration_seconds as number) || 0,
+        activityPercentage: Number(d.activity_percentage) || 100,
+        recordedAt: new Date(d.recorded_at as string),
+        createdAt: d.created_at ? new Date(d.created_at as string) : undefined
+      }));
+    } catch (err) {
+      console.error('Error getting software usage logs:', err);
+      return [];
+    }
+  }
+
+  /**
+   * Get software usage summary for an attendance record
+   */
+  async getSoftwareUsageSummary(attendanceRecordId: string): Promise<SoftwareUsageSummary[]> {
+    try {
+      const { data, error } = await supabase.rpc('get_software_usage_summary', {
+        p_attendance_id: attendanceRecordId
+      });
+
+      if (!error && Array.isArray(data)) {
+        return data.map((item: Record<string, unknown>) => ({
+          softwareName: (item.software_name as string) || 'Unknown',
+          category: (item.category as string) || 'general',
+          totalSeconds: Number(item.total_seconds ?? item.total_duration_seconds) || 0,
+          avgActivityPercentage: Number(item.avg_activity_percentage) || 100,
+          logCount: Number(item.log_count) || 1
+        }));
+      }
+
+      // Fallback: client-side aggregation from software_usage_logs
+      const { data: logs, error: logsError } = await supabase
+        .from('software_usage_logs')
+        .select('*')
+        .eq('attendance_record_id', attendanceRecordId);
+
+      if (logsError || !logs) return [];
+
+      const map = new Map<string, { softwareName: string; category: string; totalSeconds: number; scoreSum: number; count: number }>();
+      for (const log of logs) {
+        const key = `${log.software_name}-${log.category}`;
+        const existing = map.get(key) || {
+          softwareName: log.software_name,
+          category: log.category,
+          totalSeconds: 0,
+          scoreSum: 0,
+          count: 0
+        };
+        existing.totalSeconds += log.duration_seconds || 0;
+        existing.scoreSum += Number(log.activity_percentage) || 0;
+        existing.count += 1;
+        map.set(key, existing);
+      }
+
+      return Array.from(map.values()).map(item => ({
+        softwareName: item.softwareName,
+        category: item.category,
+        totalSeconds: item.totalSeconds,
+        avgActivityPercentage: item.count > 0 ? Math.round((item.scoreSum / item.count) * 100) / 100 : 100,
+        logCount: item.count
+      })).sort((a, b) => b.totalSeconds - a.totalSeconds);
+    } catch (err) {
+      console.error('Error getting software usage summary:', err);
+      return [];
     }
   }
 
